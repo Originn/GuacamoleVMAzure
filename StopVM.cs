@@ -1,11 +1,13 @@
 using System;
 using System.IO;
 using System.Threading.Tasks;
+using System.Linq;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Azure.Identity;
 using Azure.ResourceManager;
 using Azure.ResourceManager.Compute;
+using Azure.ResourceManager.Network;
 using Azure.ResourceManager.Resources;
 using Azure.Core;
 using Azure;
@@ -28,7 +30,7 @@ namespace DeployVMFunction
             [HttpTrigger(AuthorizationLevel.Function, "post", Route = null)] HttpRequestData req)
         {
             var log = req.FunctionContext.GetLogger("StopVM");
-            log.LogInformation("Processing request to stop and deallocate VM (ISOLATED WORKER).");
+            log.LogInformation("Processing request to stop and delete VM resources (ISOLATED WORKER).");
 
             // Add CORS handling
             // Check if it's a CORS preflight request
@@ -108,11 +110,63 @@ namespace DeployVMFunction
                 }
 
                 VirtualMachineResource vm = await vmCollection.GetAsync(vmName);
+                
+                // Store network interface IDs before deleting the VM
+                var networkInterfaceIds = vm.Data.NetworkProfile.NetworkInterfaces.Select(ni => ni.Id).ToList();
 
-                log.LogInformation($"Deallocating VM: {vmName}");
-                await vm.DeallocateAsync(WaitUntil.Completed);
+                // Delete the VM (instead of just deallocating it)
+                log.LogInformation($"Deleting VM: {vmName}");
+                await vm.DeleteAsync(Azure.WaitUntil.Completed);
+                log.LogInformation($"VM {vmName} deleted successfully.");
 
-                log.LogInformation($"VM {vmName} stopped (deallocated) successfully.");
+                // Delete associated network interfaces
+                foreach (var nicId in networkInterfaceIds)
+                {
+                    try 
+                    {
+                        log.LogInformation($"Deleting network interface: {nicId}");
+                        var nicResource = armClient.GetNetworkInterfaceResource(nicId);
+                        
+                        // Store NSG ID before deleting the NIC
+                        string? nsgId = null;
+                        try
+                        {
+                            var nicResponse = await nicResource.GetAsync();
+                            var nic = nicResponse.Value;
+                            nsgId = nic.Data.NetworkSecurityGroup?.Id;
+                        }
+                        catch (Exception ex)
+                        {
+                            log.LogWarning($"Could not retrieve NSG for NIC {nicId}: {ex.Message}");
+                        }
+                        
+                        // Delete the NIC
+                        await nicResource.DeleteAsync(Azure.WaitUntil.Completed);
+                        log.LogInformation($"Network interface {nicId} deleted successfully.");
+                        
+                        // Delete associated NSG if it exists
+                        if (!string.IsNullOrEmpty(nsgId))
+                        {
+                            try
+                            {
+                                log.LogInformation($"Deleting network security group: {nsgId}");
+                                var nsgResource = armClient.GetNetworkSecurityGroupResource(new ResourceIdentifier(nsgId));
+                                await nsgResource.DeleteAsync(Azure.WaitUntil.Completed);
+                                log.LogInformation($"Network security group {nsgId} deleted successfully.");
+                            }
+                            catch (Exception ex)
+                            {
+                                log.LogWarning($"Error deleting NSG {nsgId}: {ex.Message}");
+                                // Continue with cleanup even if NSG deletion fails
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        log.LogWarning($"Error deleting network interface {nicId}: {ex.Message}");
+                        // Continue with cleanup even if NIC deletion fails
+                    }
+                }
 
                 var responseOk = req.CreateResponse(HttpStatusCode.OK);
                 // Add CORS headers
@@ -120,7 +174,7 @@ namespace DeployVMFunction
                 responseOk.Headers.Add("Access-Control-Allow-Credentials", "true");
                 await responseOk.WriteAsJsonAsync(new {
                     status = "success",
-                    message = $"VM {vmName} stopped successfully"
+                    message = $"VM {vmName} and associated resources deleted successfully"
                 });
                 return responseOk;
             }
