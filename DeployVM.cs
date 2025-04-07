@@ -21,7 +21,6 @@ using Azure; // Needed for ArmOperation, Response, WaitUntil etc.
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
 using System.Net;
-using System.Security.Cryptography; // Used in GenerateSecurePassword
 using System.Net.Sockets; // Used for TcpClient in RDP check
 
 namespace DeployVMFunction
@@ -90,8 +89,8 @@ namespace DeployVMFunction
 
                 var poolManager = new VMPoolManager(log);
 
-                log.LogInformation("Generating a secure random password for SolidCAMOperator account");
-                Task<string> passwordGenerationTask = Task.Run(() => GenerateSecurePassword(16));
+                // Instead of generating a password immediately, we'll check storage first
+                string? randomPassword = null;
 
                 log.LogInformation("Requesting VM from the warm pool");
                 Task<VirtualMachineResource> vmAllocationTask;
@@ -184,10 +183,7 @@ namespace DeployVMFunction
                                 var cmdInput = new RunCommandInput("RunPowerShellScript");
                                 cmdInput.Script.Add(checkScript);
 
-                                // --- Fix for CS0029 (Error 1) ---
-                                // Change type from Response<T> to ArmOperation<T>
                                 ArmOperation<VirtualMachineRunCommandResult> cmdResultOperation = await vm.RunCommandAsync(WaitUntil.Completed, cmdInput);
-                                // --- End Fix ---
 
                                 // Access Value property of ArmOperation<T> to get VirtualMachineRunCommandResult
                                 VirtualMachineRunCommandResult? runResult = cmdResultOperation.Value;
@@ -204,51 +200,33 @@ namespace DeployVMFunction
 
                 if (!isRdpReady) { log.LogWarning($"VM {vmName} RDP service did not become responsive. Proceeding anyway..."); }
 
-                string randomPassword = await passwordGenerationTask;
-
-                // --- Execute Password Reset Script with Detailed Logging ---
-                try
+                // Get the VM password from storage
+                randomPassword = Program.GetVMPassword(vmName, log);
+                
+                // If no password was found in storage, generate one and configure the user account
+                if (string.IsNullOrEmpty(randomPassword))
                 {
-                    string psScript = @"$p = ConvertTo-SecureString '" + randomPassword + @"' -AsPlainText -Force; $u = 'SolidCAMOperator'; try { Write-Output 'Getting user...'; $e = Get-LocalUser -Name $u -EA SilentlyContinue; if ($e) { Write-Output 'Setting pwd...'; Set-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires $true; Write-Output 'Set pwd done.'; } else { Write-Output 'Creating user...'; New-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires $true; Write-Output 'Create user done.'; } Write-Output 'Enabling user...'; Enable-LocalUser -Name $u; Write-Output 'Enable done.'; Write-Output 'Adding group member...'; Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $u -EA SilentlyContinue; Write-Output 'Add group done.'; Write-Output 'Success.'; } catch { Write-Error ""ERR: $($_.Exception.Message)""; Write-Error ""Trace: $($_.ScriptStackTrace)""; }";
-                    var runCommandInput = new RunCommandInput("RunPowerShellScript");
-                    runCommandInput.Script.Add(psScript);
-
-                    var commandStartTime = DateTime.UtcNow;
-                    log.LogInformation($"[{commandStartTime:O}] START executing PowerShell password reset script on VM {vmName}.");
-
-                    // --- Fix for CS0029 (Error 2) ---
-                    // Change type from Response<T> to ArmOperation<T>
-                    ArmOperation<VirtualMachineRunCommandResult>? passwordResetOperation = null;
-                    try
+                    log.LogWarning($"No stored password found for VM {vmName}. Generating and configuring a new password.");
+                    randomPassword = Program.GenerateSecurePassword(16);
+                    
+                    // Configure the SolidCAMOperator account with the new password
+                    bool configSuccess = await Program.ConfigureVMUserAccountAsync(vm, randomPassword, log);
+                    
+                    if (configSuccess)
                     {
-                         passwordResetOperation = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                        // Store the password for future use
+                        await Program.StoreVMPasswordAsync(vmName, randomPassword, log);
+                        log.LogInformation($"Successfully configured and stored new password for VM {vmName}");
                     }
-                    catch (Exception runCmdEx) { log.LogError(runCmdEx, $"Exception thrown DIRECTLY by vm.RunCommandAsync for password reset on {vmName}."); throw; }
-                    // --- End Fix ---
-
-                    var commandEndTime = DateTime.UtcNow;
-                    var commandDuration = commandEndTime - commandStartTime;
-                    log.LogInformation($"[{commandEndTime:O}] FINISHED executing PowerShell password reset script on VM {vmName}. Duration: {commandDuration.TotalSeconds:F2} seconds.");
-
-                    // --- Fix for CS0119 / CS0446 (uses corrected type from above) ---
-                    // Access Value property of ArmOperation<T> first
-                    VirtualMachineRunCommandResult? passwordResetResult = passwordResetOperation?.Value;
-                    // Then access Value property of VirtualMachineRunCommandResult (the list)
-                    if (passwordResetResult?.Value != null && passwordResetResult.Value.Any())
+                    else
                     {
-                        log.LogInformation($"--- Script Output/Error Messages for VM {vmName} ---");
-                        // Loop over the inner list: passwordResetResult.Value
-                        foreach (var status in passwordResetResult.Value)
-                        {
-                             log.LogInformation($"Script Msg: Level='{status.Level}', Code='{status.Code}', DisplayStatus='{status.DisplayStatus}', Message='{status.Message?.Trim()}'");
-                        }
-                        log.LogInformation($"--- End Script Output/Error Messages ---");
+                        log.LogError($"Failed to configure user account for VM {vmName}. Deployment might fail.");
                     }
-                    else if (passwordResetResult != null) { log.LogWarning($"Password reset script executed for VM {vmName}, but no detailed output messages returned (List was null or empty)."); }
-                    else { log.LogWarning($"Password reset script execution result or its value was null for VM {vmName}."); }
-                    // --- End Fix ---
                 }
-                catch (Exception ex) { log.LogError(ex, $"Outer catch block: Error during password reset process for VM {vmName}."); }
+                else
+                {
+                    log.LogInformation($"Retrieved existing password for VM {vmName} from storage");
+                }
 
                 // --- Prepare Guacamole token authentication ---
                 log.LogInformation($"Preparing Guacamole connection for VM {vmName} ({targetVmPrivateIp})...");
@@ -258,7 +236,10 @@ namespace DeployVMFunction
                 string? dataSource = null;
                 try
                 {
-                    var tokenRequestContent = new FormUrlEncodedContent(new[] { new KeyValuePair<string, string>("username", guacamoleApiUsername), new KeyValuePair<string, string>("password", guacamoleApiPassword) });
+                    var tokenRequestContent = new FormUrlEncodedContent(new[] { 
+                        new KeyValuePair<string, string>("username", guacamoleApiUsername), 
+                        new KeyValuePair<string, string>("password", guacamoleApiPassword) 
+                    });
                     using var request = new HttpRequestMessage(HttpMethod.Post, tokenUrl) { Content = tokenRequestContent };
                     var tokenResponse = await httpClient.SendAsync(request);
                     string tokenResponseBody = await tokenResponse.Content.ReadAsStringAsync();
@@ -266,10 +247,18 @@ namespace DeployVMFunction
                         var tokenData = JObject.Parse(tokenResponseBody);
                         authToken = tokenData["authToken"]?.ToString();
                         dataSource = tokenData["dataSource"]?.ToString();
-                        if (string.IsNullOrEmpty(authToken) || string.IsNullOrEmpty(dataSource)) { log.LogError($"Guac token API OK but missing data. Resp: {tokenResponseBody}"); }
-                        else { log.LogInformation($"Guac auth token acquired for datasource '{dataSource}'."); }
-                    } else { log.LogError($"Error getting Guac token: {tokenResponse.StatusCode} - {tokenResponseBody}"); }
-                } catch (Exception ex) { log.LogError(ex, $"Exception during Guac token API call: {ex.ToString()}"); }
+                        if (string.IsNullOrEmpty(authToken) || string.IsNullOrEmpty(dataSource)) { 
+                            log.LogError($"Guac token API OK but missing data. Resp: {tokenResponseBody}"); 
+                        }
+                        else { 
+                            log.LogInformation($"Guac auth token acquired for datasource '{dataSource}'."); 
+                        }
+                    } else { 
+                        log.LogError($"Error getting Guac token: {tokenResponse.StatusCode} - {tokenResponseBody}"); 
+                    }
+                } catch (Exception ex) { 
+                    log.LogError(ex, $"Exception during Guac token API call: {ex.ToString()}"); 
+                }
 
                 if (string.IsNullOrEmpty(authToken) || string.IsNullOrEmpty(dataSource))
                 {
@@ -281,7 +270,8 @@ namespace DeployVMFunction
                     return authErrorResponse;
                 }
 
-                string? guacamoleConnectionId = await CreateGuacamoleConnection(vmName, targetVmPrivateIp, "SolidCAMOperator", randomPassword, guacamoleApiBaseUrl, authToken, dataSource, log);
+                string? guacamoleConnectionId = await CreateGuacamoleConnection(vmName, targetVmPrivateIp, "SolidCAMOperator", 
+                                                                           randomPassword, guacamoleApiBaseUrl, authToken, dataSource, log);
 
                 if (string.IsNullOrEmpty(guacamoleConnectionId))
                 {
@@ -340,44 +330,37 @@ namespace DeployVMFunction
             }
         }
 
-        // Generate a secure random password
-        private static string GenerateSecurePassword(int length)
-        {
-            const string uppercaseChars = "ABCDEFGHJKLMNPQRSTUVWXYZ";
-            const string lowercaseChars = "abcdefghijkmnpqrstuvwxyz";
-            const string numericChars = "23456789";
-            const string specialChars = "!@#$%^&*()-_=+[]{}|;:,.<>?";
-            var allChars = uppercaseChars + lowercaseChars + numericChars + specialChars;
-            var password = new char[length];
-            var requiredChars = new List<char> {
-                uppercaseChars[RandomNumberGenerator.GetInt32(uppercaseChars.Length)],
-                lowercaseChars[RandomNumberGenerator.GetInt32(lowercaseChars.Length)],
-                numericChars[RandomNumberGenerator.GetInt32(numericChars.Length)],
-                specialChars[RandomNumberGenerator.GetInt32(specialChars.Length)]
-            };
-            if (length < requiredChars.Count) throw new ArgumentException("Password length too short.", nameof(length));
-            for (int i = 0; i < requiredChars.Count; i++) password[i] = requiredChars[i];
-            for (int i = requiredChars.Count; i < length; i++) password[i] = allChars[RandomNumberGenerator.GetInt32(allChars.Length)];
-            for (int i = password.Length - 1; i > 0; i--) { int j = RandomNumberGenerator.GetInt32(i + 1); (password[i], password[j]) = (password[j], password[i]); }
-            return new string(password);
-        }
-
         // Create Guacamole Connection
-        private static async Task<string?> CreateGuacamoleConnection(string connectionName, string targetIpAddress, string targetUsername, string targetPassword, string guacamoleApiBaseUrl, string authToken, string dataSource, ILogger log)
+        private static async Task<string?> CreateGuacamoleConnection(string connectionName, string targetIpAddress, 
+                                                                string targetUsername, string targetPassword, 
+                                                                string guacamoleApiBaseUrl, string authToken, 
+                                                                string dataSource, ILogger log)
         {
             string createConnectionUrl = $"{guacamoleApiBaseUrl.TrimEnd('/')}/api/session/data/{dataSource}/connections?token={authToken}";
-            var connectionPayload = new JObject( /* ... JObject definition as before ... */
-                 new JProperty("parentIdentifier", "ROOT"), new JProperty("name", connectionName), new JProperty("protocol", "rdp"),
-                 new JProperty("parameters", new JObject(
-                     new JProperty("hostname", targetIpAddress), new JProperty("port", "3389"),
-                     new JProperty("username", targetUsername), new JProperty("password", targetPassword),
-                     new JProperty("ignore-cert", "true"), new JProperty("security", "nla"),
-                     new JProperty("resize-method", "display-update"), new JProperty("enable-drive", "false"),
-                     new JProperty("enable-wallpaper", "false"), new JProperty("enable-theming", "false"),
-                     new JProperty("enable-font-smoothing", "true"), new JProperty("enable-full-window-drag", "false"),
-                     new JProperty("enable-desktop-composition", "false"), new JProperty("enable-menu-animations", "false"),
-                     new JProperty("disable-bitmap-caching", "false"), new JProperty("disable-offscreen-caching", "false")
-                  )), new JProperty("attributes", new JObject())); // Keep attributes simple unless needed
+            var connectionPayload = new JObject(
+                new JProperty("parentIdentifier", "ROOT"), 
+                new JProperty("name", connectionName), 
+                new JProperty("protocol", "rdp"),
+                new JProperty("parameters", new JObject(
+                    new JProperty("hostname", targetIpAddress), 
+                    new JProperty("port", "3389"),
+                    new JProperty("username", targetUsername), 
+                    new JProperty("password", targetPassword),
+                    new JProperty("ignore-cert", "true"), 
+                    new JProperty("security", "nla"),
+                    new JProperty("resize-method", "display-update"), 
+                    new JProperty("enable-drive", "false"),
+                    new JProperty("enable-wallpaper", "false"), 
+                    new JProperty("enable-theming", "false"),
+                    new JProperty("enable-font-smoothing", "true"), 
+                    new JProperty("enable-full-window-drag", "false"),
+                    new JProperty("enable-desktop-composition", "false"), 
+                    new JProperty("enable-menu-animations", "false"),
+                    new JProperty("disable-bitmap-caching", "false"), 
+                    new JProperty("disable-offscreen-caching", "false")
+                )), 
+                new JProperty("attributes", new JObject())
+            );
 
             log.LogInformation($"Attempting to create Guacamole connection: POST {createConnectionUrl.Split('?')[0]}?token=...");
             try {
@@ -389,14 +372,24 @@ namespace DeployVMFunction
                         log.LogInformation($"Guac Create Connection Response: {response.StatusCode}");
                         var createdConnection = JObject.Parse(responseBody);
                         string? identifier = createdConnection["identifier"]?.ToString();
-                        if (string.IsNullOrEmpty(identifier)) { log.LogError($"Guac connection create OK but missing 'identifier' in response: {responseBody}"); return null; }
+                        if (string.IsNullOrEmpty(identifier)) { 
+                            log.LogError($"Guac connection create OK but missing 'identifier' in response: {responseBody}"); 
+                            return null; 
+                        }
                         string rawIdentifierForUrl = $"{identifier}\0c\0{dataSource}";
-                        string encodedIdentifier = Convert.ToBase64String(Encoding.UTF8.GetBytes(rawIdentifierForUrl)).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+                        string encodedIdentifier = Convert.ToBase64String(Encoding.UTF8.GetBytes(rawIdentifierForUrl))
+                            .Replace('+', '-').Replace('/', '_').TrimEnd('=');
                         log.LogInformation($"Guac connection created: Identifier='{identifier}', DataSource='{dataSource}', Encoded='{encodedIdentifier}'");
                         return encodedIdentifier;
-                    } else { log.LogError($"Error creating Guac connection: {response.StatusCode} - Body: {responseBody}"); return null; }
+                    } else { 
+                        log.LogError($"Error creating Guac connection: {response.StatusCode} - Body: {responseBody}"); 
+                        return null; 
+                    }
                 }
-            } catch (Exception ex) { log.LogError(ex, $"Exception during Guac create connection API call: {ex.ToString()}"); return null; }
+            } catch (Exception ex) { 
+                log.LogError(ex, $"Exception during Guac create connection API call: {ex.ToString()}"); 
+                return null; 
+            }
         }
     }
 }

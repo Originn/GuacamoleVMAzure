@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.Sockets;
 using System.Text;
+using System.Security.Cryptography;
 using Azure;
 using Azure.Identity;
 using Azure.ResourceManager;
@@ -18,361 +19,350 @@ using Azure.ResourceManager.Network;
 using Azure.ResourceManager.Network.Models;
 using Azure.ResourceManager.Resources;
 using Azure.Core;
+using Azure.Data.Tables;
 using DeployVMFunction;
 using Microsoft.Extensions.Configuration;
 
-// Create task that initializes the VM pool in the background
-var initializePoolTask = Task.Run(async () =>
+namespace DeployVMFunction
 {
-    // Set up basic console logging for the initialization process
-    using var loggerFactory = LoggerFactory.Create(builder =>
+    public static class Program
     {
-        // Add console logger with more detailed information
-        builder.AddConsole(options => options.IncludeScopes = true);
-        builder.SetMinimumLevel(LogLevel.Information);
-    });
+        // Initialize a global table client for VM credentials
+        private static TableClient credentialsTableClient = null;
 
-    // Set up configuration to read settings
-    var configuration = new ConfigurationBuilder()
-        .SetBasePath(Environment.CurrentDirectory)
-        .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
-        .AddEnvironmentVariables()
-        .Build();
+        // Initialize a dictionary for caching VM passwords
+        private static Dictionary<string, string> vmCredentialsCache = new Dictionary<string, string>();
 
-    // Create a logger instance
-    var logger = loggerFactory.CreateLogger("VMPoolInitialization");
-
-    // --- Configuration Reading ---
-    // Check if the pool initialization feature is enabled in settings. Default to false.
-    bool initializeVMPool = configuration.GetValue("VMPoolSettings__InitializePool", false);
-
-    if (!initializeVMPool)
-    {
-        logger.LogInformation("VM pool initialization is disabled via configuration (VMPoolSettings:InitializePool = false). Skipping initialization.");
-        return; // Stop execution of this task if disabled
-    }
-
-    // Read the desired minimum pool size. Default to 2 if not specified.
-    int minPoolSize = configuration.GetValue("MIN_POOL_SIZE", 2);
-    
-    // NEW: Read the warm-up time. Default to 3 minutes (180 seconds) for proper initialization
-    int warmupDelaySeconds = configuration.GetValue("VMPoolSettings__WarmupDelaySeconds", 180);
-    
-    // NEW: Read the maximum number of attempts for service checks
-    int maxServiceCheckAttempts = configuration.GetValue("VMPoolSettings__MaxServiceCheckAttempts", 10);
-    
-    // NEW: Read the delay between service check attempts
-    int serviceCheckDelaySeconds = configuration.GetValue("VMPoolSettings__ServiceCheckDelaySeconds", 10);
-
-    logger.LogInformation($"Target minimum VM pool size configured: {minPoolSize}");
-    logger.LogInformation($"VM warm-up time configured: {warmupDelaySeconds} seconds");
-
-    // --- VM Pool Management ---
-    try
-    {
-        var poolManager = new VMPoolManager(logger);
-        
-        logger.LogInformation("Attempting to clean up any orphaned Azure resources (VMs, NICs, Disks) tagged for the pool...");
-        await poolManager.CleanupOrphanedResourcesAsync();
-        logger.LogInformation("Orphaned resource cleanup process completed.");
-
-        logger.LogInformation("Checking current VM pool status...");
-        var status = await poolManager.GetPoolStatusAsync();
-        logger.LogInformation($"Initial pool status: {status.DeallocatedVMs.Count} deallocated VM(s) found in the pool.");
-
-        // Determine how many VMs need to be created
-        int needed = minPoolSize - status.DeallocatedVMs.Count;
-
-        if (needed > 0)
+        public static void Main(string[] args)
         {
-            logger.LogInformation($"Pool needs {needed} new VM(s) to reach the target size of {minPoolSize}. Starting creation and warm-up process.");
+            Console.WriteLine("======= AZURE FUNCTION HOST PROCESS STARTING =======");
+            Console.WriteLine($"Current time: {DateTime.Now}");
+            Console.WriteLine($"Current directory: {Environment.CurrentDirectory}");
+            Console.WriteLine("Configuring Azure Functions host...");
 
-            var newVMs = new List<VirtualMachineResource>(); // To hold references to successfully created VMs
+            // Set up configuration to read settings
+            var configuration = new ConfigurationBuilder()
+                .SetBasePath(Environment.CurrentDirectory)
+                .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
+                .AddEnvironmentVariables()
+                .Build();
 
-            // Step 1: Create VMs (in parallel)
-            logger.LogInformation($"--- Phase 1: Creating {needed} VM(s) ---");
-            List<Task<VirtualMachineResource>> creationTasks = new List<Task<VirtualMachineResource>>();
-            for (int i = 0; i < needed; i++)
+            // Initialize Table Storage for VM credentials
+            string storageConnectionString = configuration.GetConnectionString("AzureWebJobsStorage");
+            if (!string.IsNullOrEmpty(storageConnectionString))
             {
-                logger.LogInformation($"=========== STARTING VM CREATION PROCESS ===========");
-                logger.LogInformation($"Current time: {DateTime.Now}");
                 try
                 {
-                    // Test the Azure connection before trying to create VMs
-                    logger.LogInformation("Testing Azure credentials and access...");
-                    var credential = new DefaultAzureCredential();
-                    var armClient = new ArmClient(credential);
-                    var subscription = await armClient.GetDefaultSubscriptionAsync();
-                    logger.LogInformation($"Successfully connected to subscription: {subscription.Data.SubscriptionId}");
+                    credentialsTableClient = new TableClient(storageConnectionString, "VMCredentials");
+                    credentialsTableClient.CreateIfNotExists();
+                    Console.WriteLine("Initialized VM credentials table storage");
                     
-                    // Check if we can see the resource group
-                    var resourceGroup = await subscription.GetResourceGroupAsync(
-                        Environment.GetEnvironmentVariable("AZURE_RESOURCE_GROUP") ?? "SolidCAM-Golden-Image_group");
-                    logger.LogInformation($"Successfully found resource group: {resourceGroup.Value.Data.Name}"); // Added .Value
-                    
-                    // Test if we can access the VMPool manager's functionality
-                    var testStatus = await poolManager.GetPoolStatusAsync();
-                    logger.LogInformation($"Initial VM Pool status - Running: {testStatus.RunningVMs.Count}, " +
-                                         $"Deallocated: {testStatus.DeallocatedVMs.Count}, " +
-                                         $"Transitioning: {testStatus.TransitioningVMs.Count}, " +
-                                         $"Other: {testStatus.OtherVMs.Count}");
+                    // Load existing credentials into cache
+                    LoadCredentialsFromTable();
                 }
                 catch (Exception ex)
                 {
-                    logger.LogError(ex, "ERROR during Azure connection test. VM creation may fail!");
+                    Console.WriteLine($"Failed to initialize Table Storage for VM credentials: {ex.Message}");
+                }
+            }
+
+            // Create a host builder with the necessary configuration
+            var host = new HostBuilder()
+                .ConfigureFunctionsWorkerDefaults()
+                .ConfigureLogging(logging =>
+                {
+                    logging.AddSimpleConsole(options =>
+                    {
+                        options.IncludeScopes = true;
+                        options.SingleLine = false;
+                        options.TimestampFormat = "yyyy-MM-dd HH:mm:ss.fff ";
+                    });
+                    logging.SetMinimumLevel(LogLevel.Information);
+                })
+                .ConfigureServices((context, services) =>
+                {
+                    // Register services if needed
+                })
+                .Build();
+
+            Console.WriteLine("Main thread: Building Azure Functions host complete.");
+            Console.WriteLine("Main thread: Starting VM Pool initialization in the background...");
+
+            // Start VM pool initialization in the background
+            var initializePoolTask = Task.Run(async () =>
+            {
+                await InitializeVMPoolAsync();
+            });
+
+            // The host will run and listen for triggers
+            Console.WriteLine("Main thread: Starting Azure Functions host...");
+            host.Run();
+
+            Console.WriteLine("Main thread: Azure Functions host has shut down.");
+        }
+
+        // Method to initialize the VM pool
+        private static async Task InitializeVMPoolAsync()
+        {
+            using var loggerFactory = LoggerFactory.Create(builder =>
+            {
+                builder.AddConsole(options => options.IncludeScopes = true);
+                builder.SetMinimumLevel(LogLevel.Information);
+            });
+
+            var logger = loggerFactory.CreateLogger("VMPoolInitialization");
+            logger.LogInformation("Beginning VM pool initialization...");
+
+            try
+            {
+                // Set up configuration to read settings
+                var configuration = new ConfigurationBuilder()
+                    .SetBasePath(Environment.CurrentDirectory)
+                    .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
+                    .AddEnvironmentVariables()
+                    .Build();
+
+                // Check if the pool initialization feature is enabled
+                bool initializeVMPool = configuration.GetValue("VMPoolSettings__InitializePool", false);
+                if (!initializeVMPool)
+                {
+                    logger.LogInformation("VM pool initialization is disabled via configuration. Skipping initialization.");
+                    return;
                 }
 
+                // Read pool configuration settings
+                int minPoolSize = configuration.GetValue("MIN_POOL_SIZE", 2);
+                int warmupDelaySeconds = configuration.GetValue("VMPoolSettings__WarmupDelaySeconds", 180);
+                int maxServiceCheckAttempts = configuration.GetValue("VMPoolSettings__MaxServiceCheckAttempts", 10);
+                int serviceCheckDelaySeconds = configuration.GetValue("VMPoolSettings__ServiceCheckDelaySeconds", 10);
 
-                // Add this before the VM warmup code (around line 120):
+                logger.LogInformation($"Target minimum VM pool size configured: {minPoolSize}");
+                logger.LogInformation($"VM warm-up time configured: {warmupDelaySeconds} seconds");
 
-                logger.LogInformation($"=========== VM CREATION COMPLETED, STARTING WARMUP ===========");
-                logger.LogInformation($"Created VMs: {string.Join(", ", newVMs.Select(vm => vm.Data.Name))}");
-                creationTasks.Add(poolManager.CreateAndReturnRunningVMAsync("pool"));
-            }
-            
-            // Wait for all creation tasks and handle results/exceptions with improved error handling
-            var creationResults = await Task.WhenAll(creationTasks.Select(async task => {
-                try {
-                    var vm = await task;
-                    logger.LogInformation($"Successfully created VM: {vm.Data.Name} (State: Deallocated)");
-                    return vm;
-                } catch (Exception ex) {
-                    logger.LogError(ex, "Failed to create a VM during pool initialization.");
-                    return null; // Indicate failure
+                // Create and use the VM pool manager
+                var poolManager = new VMPoolManager(logger);
+                
+                // Clean up any orphaned resources
+                logger.LogInformation("Cleaning up any orphaned Azure resources...");
+                await poolManager.CleanupOrphanedResourcesAsync();
+                
+                // Check current pool status
+                logger.LogInformation("Checking current VM pool status...");
+                var status = await poolManager.GetPoolStatusAsync();
+                logger.LogInformation($"Initial pool status: {status.DeallocatedVMs.Count} deallocated VM(s) found in the pool.");
+
+                // Calculate how many VMs need to be created
+                int needed = minPoolSize - status.DeallocatedVMs.Count;
+                if (needed <= 0)
+                {
+                    logger.LogInformation($"Pool size ({status.DeallocatedVMs.Count}) already meets or exceeds minimum ({minPoolSize}). No action needed.");
+                    return;
                 }
-            }));
-            
-            newVMs.AddRange(creationResults.Where(vm => vm != null)); // Add only successfully created VMs
-            logger.LogInformation($"--- Phase 1 Complete: {newVMs.Count} out of {needed} VMs created successfully ---");
 
-            // Step 2: Warm-up VMs with enhanced initialization and verification
-            if (newVMs.Any())
-            {
-                 logger.LogInformation($"--- Phase 2: Warming up {newVMs.Count} new VM(s) with enhanced validation ---");
-                 
-                 // Process each VM in parallel for efficient processing
-                 List<Task> warmupTasks = new List<Task>();
-                 foreach (var vm in newVMs)
-                 {
-                     warmupTasks.Add(ProcessVMWarmupAsync(vm, warmupDelaySeconds, maxServiceCheckAttempts, serviceCheckDelaySeconds, logger));
-                 }
-                 
-                 // Wait for all VMs to complete their warm-up process
-                 await Task.WhenAll(warmupTasks);
-                 logger.LogInformation($"--- Phase 2 Complete: Warm-up process finished for {newVMs.Count} VMs ---");
-            } 
-            else 
-            {
-                 logger.LogInformation("--- Phase 2 Skipped: No new VMs were successfully created to warm up. ---");
+                logger.LogInformation($"Pool needs {needed} new VM(s) to reach the target size of {minPoolSize}.");
+                var newVMs = new List<VirtualMachineResource>();
+
+                // Create VMs
+                for (int i = 0; i < needed; i++)
+                {
+                    try
+                    {
+                        logger.LogInformation($"Creating VM {i+1} of {needed}...");
+                        var vm = await poolManager.CreateAndReturnRunningVMAsync("pool");
+                        logger.LogInformation($"Successfully created VM: {vm.Data.Name}");
+                        
+                        // Generate and store password for the VM
+                        var password = GenerateSecurePassword(16);
+                        bool configSuccess = await ConfigureVMUserAccountAsync(vm, password, logger);
+                        
+                        if (configSuccess)
+                        {
+                            // Store password in Table Storage and memory cache
+                            await StoreVMPasswordAsync(vm.Data.Name, password, logger);
+                            logger.LogInformation($"Successfully configured user account for VM {vm.Data.Name}");
+                            newVMs.Add(vm);
+                        }
+                        else
+                        {
+                            logger.LogWarning($"Failed to configure user account for VM {vm.Data.Name}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, $"Failed to create VM {i+1} of {needed}");
+                    }
+                }
+
+                logger.LogInformation($"Created {newVMs.Count} out of {needed} VMs.");
+
+                // Warm up created VMs
+                if (newVMs.Any())
+                {
+                    logger.LogInformation($"Warming up {newVMs.Count} new VM(s)...");
+                    
+                    foreach (var vm in newVMs)
+                    {
+                        try
+                        {
+                            await WarmupVMAsync(vm, warmupDelaySeconds, maxServiceCheckAttempts, serviceCheckDelaySeconds, logger);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, $"Error during warmup for VM {vm.Data.Name}");
+                        }
+                    }
+                    
+                    logger.LogInformation("Warm-up process completed.");
+                }
+
+                // Get final pool status
+                var finalStatus = await poolManager.GetPoolStatusAsync();
+                logger.LogInformation($"Pool initialization complete. Final pool status: {finalStatus.DeallocatedVMs.Count} deallocated VM(s) available.");
             }
-
-            // Final status check after initialization
-            var finalStatus = await poolManager.GetPoolStatusAsync();
-            logger.LogInformation($"Pool initialization complete. Final pool status: {finalStatus.DeallocatedVMs.Count} deallocated VM(s) available.");
-        }
-        else
-        {
-            logger.LogInformation($"Pool size ({status.DeallocatedVMs.Count}) already meets or exceeds minimum ({minPoolSize}). No action needed.");
-        }
-    }
-    catch (Exception ex)
-    {
-        logger.LogCritical(ex, "A critical error occurred during the VM pool management process. Pool might be in an inconsistent state.");
-        // Don't throw here as we don't want to prevent the host from starting
-    }
-});
-
-Console.WriteLine("======= VM POOL INITIALIZATION STARTED =======");
-Console.WriteLine($"Current time: {DateTime.Now}");
-Console.WriteLine($"Current directory: {Environment.CurrentDirectory}");
-
-try
-{
-    // Read config values BEFORE creating the logger to ensure we can see any issues
-    Console.WriteLine("Reading configuration...");
-    var tempConfig = new ConfigurationBuilder()
-        .SetBasePath(Environment.CurrentDirectory)
-        .AddJsonFile("local.settings.json", optional: true, reloadOnChange: true)
-        .AddEnvironmentVariables()
-        .Build();
-    
-    bool isPoolEnabled = tempConfig.GetValue("VMPoolSettings__InitializePool", false);
-    int configuredPoolSize = tempConfig.GetValue("MIN_POOL_SIZE", 0);
-    
-    Console.WriteLine($"DEBUG: VMPoolSettings__InitializePool = {isPoolEnabled}");
-    Console.WriteLine($"DEBUG: MIN_POOL_SIZE = {configuredPoolSize}");
-    
-    // If using dotnet environment variables format, also check those
-    bool isPoolEnabledAlt = tempConfig.GetValue("VMPoolSettings:InitializePool", false);
-    Console.WriteLine($"DEBUG: VMPoolSettings:InitializePool (alt format) = {isPoolEnabledAlt}");
-    
-    // Dump all environment variables for debugging (just the ones with VM in the name)
-    foreach (var env in Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>())
-    {
-        if (env.Key.ToString().ToUpper().Contains("VM") || 
-            env.Key.ToString().ToUpper().Contains("POOL") ||
-            env.Key.ToString().ToUpper().Contains("AZURE"))
-        {
-            Console.WriteLine($"ENV VAR: {env.Key} = {env.Value}");
-        }
-    }
-}
-catch (Exception configEx)
-{
-    Console.WriteLine($"ERROR during config initialization: {configEx.Message}");
-    Console.WriteLine($"Stack trace: {configEx.StackTrace}");
-}
-
-// NEW: Extract the VM warm-up process to a separate method for better readability and maintenance
-static async Task ProcessVMWarmupAsync(VirtualMachineResource vm, int warmupDelaySeconds, int maxAttempts, int attemptDelaySeconds, ILogger logger)
-{
-    try
-    {
-        // Start the VM
-        logger.LogInformation($"Starting VM {vm.Data.Name} for warm-up...");
-        await vm.PowerOnAsync(Azure.WaitUntil.Completed);
-        logger.LogInformation($"VM {vm.Data.Name} started.");
-        
-        // Get the VM's private IP address for testing connectivity
-        string? vmPrivateIp = await GetVMPrivateIpAsync(vm, logger);
-        if (string.IsNullOrEmpty(vmPrivateIp))
-        {
-            logger.LogWarning($"Could not determine private IP for VM {vm.Data.Name}. Will continue with warm-up but connectivity testing will be skipped.");
-        }
-        
-        // First, allow some base initialization time
-        logger.LogInformation($"Allowing initial boot time of 60 seconds for VM {vm.Data.Name}...");
-        await Task.Delay(TimeSpan.FromSeconds(60));
-        
-        // Test for RDP connectivity if we have an IP
-        bool rdpReady = false;
-        if (!string.IsNullOrEmpty(vmPrivateIp))
-        {
-            rdpReady = await WaitForRdpServiceAsync(vmPrivateIp, maxAttempts, attemptDelaySeconds, logger);
-            if (rdpReady)
+            catch (Exception ex)
             {
-                logger.LogInformation($"RDP service on VM {vm.Data.Name} is responding.");
-            }
-            else
-            {
-                logger.LogWarning($"RDP service on VM {vm.Data.Name} did not become responsive after {maxAttempts} attempts.");
+                logger.LogCritical(ex, "A critical error occurred during the VM pool management process.");
             }
         }
-        
-        // Run initialization script to ensure all services are started and initialized
-        logger.LogInformation($"Running initialization script on VM {vm.Data.Name}...");
-        await RunInitializationScriptAsync(vm, logger);
-        
-        // Wait for any remaining warm-up time
-        int remainingWarmupTime = Math.Max(0, warmupDelaySeconds - 60 - (maxAttempts * attemptDelaySeconds));
-        if (remainingWarmupTime > 0)
-        {
-            logger.LogInformation($"Waiting additional {remainingWarmupTime}s for full initialization of VM {vm.Data.Name}...");
-            await Task.Delay(TimeSpan.FromSeconds(remainingWarmupTime));
-        }
-        
-        // Run final verification before deallocating
-        await RunFinalVerificationAsync(vm, logger);
-        
-        // Deallocate the VM
-        logger.LogInformation($"Warm-up complete for {vm.Data.Name}. Deallocating...");
-        await vm.DeallocateAsync(Azure.WaitUntil.Completed);
-        logger.LogInformation($"VM {vm.Data.Name} deallocated and returned to pool.");
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, $"Error during warm-up or deallocation for VM {vm.Data.Name}. It may require manual attention.");
-        
-        // Try to deallocate the VM if an exception occurred, to avoid leaving it running
-        try
-        {
-            logger.LogInformation($"Attempting to deallocate VM {vm.Data.Name} after error...");
-            await vm.DeallocateAsync(Azure.WaitUntil.Completed);
-            logger.LogInformation($"Successfully deallocated VM {vm.Data.Name} after error.");
-        }
-        catch (Exception deallocateEx)
-        {
-            logger.LogError(deallocateEx, $"Failed to deallocate VM {vm.Data.Name} after error. Manual intervention required.");
-        }
-    }
-}
 
-// NEW: Helper method to get VM's private IP address
-static async Task<string?> GetVMPrivateIpAsync(VirtualMachineResource vm, ILogger logger)
-{
-    try
-    {
-        // Create an ArmClient to access Azure resources
-        var credential = new DefaultAzureCredential();
-        var armClient = new ArmClient(credential);
-        
-        var firstNetworkInterface = vm.Data.NetworkProfile.NetworkInterfaces.FirstOrDefault();
-        if (firstNetworkInterface != null)
+        // Method to warm up a VM
+        private static async Task WarmupVMAsync(VirtualMachineResource vm, int warmupDelaySeconds, int maxAttempts, int attemptDelaySeconds, ILogger logger)
         {
-            var nicId = firstNetworkInterface.Id;
-            var nicResource = armClient.GetNetworkInterfaceResource(nicId);
-            
-            // Refresh to ensure we have the latest data
-            var refreshedNicResponse = await nicResource.GetAsync();
-            var refreshedNic = refreshedNicResponse.Value;
-            
-            // Get the IP configuration
-            var ipConfig = refreshedNic.Data.IPConfigurations.FirstOrDefault();
-            return ipConfig?.PrivateIPAddress;
-        }
-    }
-    catch (Exception ex)
-    {
-        logger.LogWarning(ex, $"Error retrieving private IP for VM {vm.Data.Name}");
-    }
-    
-    return null;
-}
-
-// NEW: Helper method to test RDP connectivity
-static async Task<bool> WaitForRdpServiceAsync(string ipAddress, int maxAttempts, int attemptDelaySeconds, ILogger logger)
-{
-    logger.LogInformation($"Testing RDP connectivity to {ipAddress}...");
-    
-    for (int attempt = 1; attempt <= maxAttempts; attempt++)
-    {
-        try
-        {
-            using var tcpClient = new TcpClient();
-            // Use short timeout for connection attempts
-            var connectTask = tcpClient.ConnectAsync(ipAddress, 3389);
-            
-            // Wait at most 5 seconds for connection
-            if (await Task.WhenAny(connectTask, Task.Delay(5000)) == connectTask)
+            try
             {
-                logger.LogInformation($"RDP port is responding on attempt {attempt}.");
-                return true;
+                logger.LogInformation($"Starting warm-up process for VM {vm.Data.Name}...");
+                
+                // Get the VM's private IP address for testing connectivity
+                string vmPrivateIp = await GetVMPrivateIPAsync(vm, logger);
+                if (string.IsNullOrEmpty(vmPrivateIp))
+                {
+                    logger.LogWarning($"Could not determine private IP for VM {vm.Data.Name}. Will continue with warm-up but connectivity testing will be skipped.");
+                }
+                
+                // Allow some initialization time
+                logger.LogInformation($"Allowing initial boot time of 60 seconds for VM {vm.Data.Name}...");
+                await Task.Delay(TimeSpan.FromSeconds(60));
+                
+                // Test for RDP connectivity if we have an IP
+                if (!string.IsNullOrEmpty(vmPrivateIp))
+                {
+                    bool rdpReady = await WaitForRdpServiceAsync(vmPrivateIp, maxAttempts, attemptDelaySeconds, logger);
+                    if (rdpReady)
+                    {
+                        logger.LogInformation($"RDP service on VM {vm.Data.Name} is responding.");
+                    }
+                    else
+                    {
+                        logger.LogWarning($"RDP service on VM {vm.Data.Name} did not become responsive after {maxAttempts} attempts.");
+                    }
+                }
+                
+                // Run additional initialization steps if needed
+                logger.LogInformation($"Running initialization script on VM {vm.Data.Name}...");
+                await RunInitializationScriptAsync(vm, logger);
+                
+                // Wait for any remaining warm-up time
+                int remainingWarmupTime = Math.Max(0, warmupDelaySeconds - 60 - (maxAttempts * attemptDelaySeconds));
+                if (remainingWarmupTime > 0)
+                {
+                    logger.LogInformation($"Waiting additional {remainingWarmupTime}s for full initialization of VM {vm.Data.Name}...");
+                    await Task.Delay(TimeSpan.FromSeconds(remainingWarmupTime));
+                }
+                
+                // Deallocate the VM
+                logger.LogInformation($"Warm-up complete for {vm.Data.Name}. Deallocating...");
+                await vm.DeallocateAsync(WaitUntil.Completed);
+                logger.LogInformation($"VM {vm.Data.Name} deallocated and returned to pool.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, $"Error during warm-up for VM {vm.Data.Name}");
+                
+                // Try to deallocate the VM if an exception occurred
+                try
+                {
+                    logger.LogInformation($"Attempting to deallocate VM {vm.Data.Name} after error...");
+                    await vm.DeallocateAsync(WaitUntil.Completed);
+                    logger.LogInformation($"Successfully deallocated VM {vm.Data.Name} after error.");
+                }
+                catch (Exception deallocateEx)
+                {
+                    logger.LogError(deallocateEx, $"Failed to deallocate VM {vm.Data.Name} after error. Manual intervention required.");
+                }
+                
+                throw;
+            }
+        }
+
+        // Helper method to get VM's private IP address
+        private static async Task<string> GetVMPrivateIPAsync(VirtualMachineResource vm, ILogger logger)
+        {
+            try
+            {
+                var credential = new DefaultAzureCredential();
+                var armClient = new ArmClient(credential);
+                
+                var firstNetworkInterface = vm.Data.NetworkProfile.NetworkInterfaces.FirstOrDefault();
+                if (firstNetworkInterface != null)
+                {
+                    var nicId = firstNetworkInterface.Id;
+                    var nicResource = armClient.GetNetworkInterfaceResource(nicId);
+                    
+                    var refreshedNicResponse = await nicResource.GetAsync();
+                    var refreshedNic = refreshedNicResponse.Value;
+                    
+                    var ipConfig = refreshedNic.Data.IPConfigurations.FirstOrDefault();
+                    return ipConfig?.PrivateIPAddress;
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, $"Error retrieving private IP for VM {vm.Data.Name}");
             }
             
-            logger.LogInformation($"RDP connection attempt {attempt}/{maxAttempts} timed out.");
+            return null;
         }
-        catch (Exception ex)
-        {
-            logger.LogInformation($"RDP connection attempt {attempt}/{maxAttempts} failed: {ex.GetType().Name}");
-        }
-        
-        // Only delay if we're not on the last attempt
-        if (attempt < maxAttempts)
-        {
-            await Task.Delay(TimeSpan.FromSeconds(attemptDelaySeconds));
-        }
-    }
-    
-    return false;
-}
 
-// NEW: Helper method to run initialization script on VM
-static async Task RunInitializationScriptAsync(VirtualMachineResource vm, ILogger logger)
-{
-    try
-    {
-        // Create PowerShell script that checks and initializes key services
-        string initScript = @"
+        // Helper method to wait for RDP service
+        private static async Task<bool> WaitForRdpServiceAsync(string ipAddress, int maxAttempts, int attemptDelaySeconds, ILogger logger)
+        {
+            logger.LogInformation($"Testing RDP connectivity to {ipAddress}...");
+            
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    using var tcpClient = new TcpClient();
+                    var connectTask = tcpClient.ConnectAsync(ipAddress, 3389);
+                    
+                    if (await Task.WhenAny(connectTask, Task.Delay(5000)) == connectTask)
+                    {
+                        logger.LogInformation($"RDP port is responding on attempt {attempt}.");
+                        return true;
+                    }
+                    
+                    logger.LogInformation($"RDP connection attempt {attempt}/{maxAttempts} timed out.");
+                }
+                catch (Exception ex)
+                {
+                    logger.LogInformation($"RDP connection attempt {attempt}/{maxAttempts} failed: {ex.GetType().Name}");
+                }
+                
+                if (attempt < maxAttempts)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(attemptDelaySeconds));
+                }
+            }
+            
+            return false;
+        }
+
+        // Helper method to run initialization script on VM
+        private static async Task RunInitializationScriptAsync(VirtualMachineResource vm, ILogger logger)
+        {
+            try
+            {
+                string initScript = @"
 # Initialization script to ensure all key services are running
 $servicesToCheck = @(
     'TermService',       # Remote Desktop Service
@@ -419,127 +409,237 @@ Write-Output ""Optimizing for next startup...""
 Write-Output ""Done with initialization.""
 ";
 
-        // Create the command input
-        var runCommandInput = new RunCommandInput("RunPowerShellScript");
-        runCommandInput.Script.Add(initScript);
+                var runCommandInput = new RunCommandInput("RunPowerShellScript");
+                runCommandInput.Script.Add(initScript);
 
-        // Execute the script
-        logger.LogInformation($"Executing initialization script on VM {vm.Data.Name}...");
-        var result = await vm.RunCommandAsync(Azure.WaitUntil.Completed, runCommandInput);
-        
-        // Log the output
-        if (result?.Value?.Value != null)
-        {
-            foreach (var output in result.Value.Value)
+                logger.LogInformation($"Executing initialization script on VM {vm.Data.Name}...");
+                var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                
+                if (result?.Value?.Value != null)
+                {
+                    foreach (var output in result.Value.Value)
+                    {
+                        logger.LogInformation($"Initialization output for VM {vm.Data.Name}: {output.Message}");
+                    }
+                }
+                
+                logger.LogInformation($"Initialization script completed on VM {vm.Data.Name}");
+            }
+            catch (Exception ex)
             {
-                logger.LogInformation($"Initialization output for VM {vm.Data.Name}: {output.Message}");
+                logger.LogWarning(ex, $"Failed to run initialization script on VM {vm.Data.Name}. Continuing with warm-up process.");
             }
         }
-        
-        logger.LogInformation($"Initialization script completed on VM {vm.Data.Name}");
-    }
-    catch (Exception ex)
-    {
-        logger.LogWarning(ex, $"Failed to run initialization script on VM {vm.Data.Name}. Continuing with warm-up process.");
-    }
-}
 
-// NEW: Helper method to run final verification before deallocating
-static async Task RunFinalVerificationAsync(VirtualMachineResource vm, ILogger logger)
-{
-    try
-    {
-        // Create PowerShell script for final verification
-        string verifyScript = @"
-# Final verification script
-Write-Output ""Running final verification...""
-
-# Check RDP service status
-$rdpService = Get-Service -Name 'TermService' -ErrorAction SilentlyContinue
-if ($rdpService -and $rdpService.Status -eq 'Running') {
-    Write-Output ""✓ RDP service is running correctly.""
-} else {
-    Write-Error ""RDP service is not in the expected state.""
-}
-
-# Check the Windows Update service (important for a clean system state)
-$wuService = Get-Service -Name 'wuauserv' -ErrorAction SilentlyContinue
-if ($wuService) {
-    Write-Output ""✓ Windows Update service state: $($wuService.Status)""
-}
-
-# Report system uptime (useful for diagnosing long boot times)
-$os = Get-WmiObject win32_operatingsystem
-$uptime = (Get-Date) - $os.ConvertToDateTime($os.LastBootUpTime)
-Write-Output ""✓ System uptime: $($uptime.Hours)h $($uptime.Minutes)m $($uptime.Seconds)s""
-
-# Report available memory
-$computerSystem = Get-CimInstance CIM_ComputerSystem
-$totalMemoryGB = [math]::Round($computerSystem.TotalPhysicalMemory / 1GB, 2)
-Write-Output ""✓ Total memory: $totalMemoryGB GB""
-
-# Final verification complete
-Write-Output ""Final verification complete. VM ready for deallocation.""
-";
-
-        // Create the command input
-        var verifyCommandInput = new RunCommandInput("RunPowerShellScript");
-        verifyCommandInput.Script.Add(verifyScript);
-
-        // Execute the script
-        logger.LogInformation($"Running final verification on VM {vm.Data.Name}...");
-        var result = await vm.RunCommandAsync(Azure.WaitUntil.Completed, verifyCommandInput);
-        
-        // Log the output
-        if (result?.Value?.Value != null)
+        // Generate a secure random password
+        public static string GenerateSecurePassword(int length)
         {
-            foreach (var output in result.Value.Value)
+            const string uppercaseChars = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // Excluded I, O
+            const string lowercaseChars = "abcdefghijkmnpqrstuvwxyz"; // Excluded l, o
+            const string numericChars = "23456789";                   // Excluded 0, 1
+            const string specialChars = "!@#$%^&*()-_=+[]{}|;:,.<>?"; // Common special characters
+            var allChars = uppercaseChars + lowercaseChars + numericChars + specialChars;
+            var password = new char[length];
+            
+            // Ensure at least one of each required type
+            var requiredChars = new List<char>
             {
-                logger.LogInformation($"Verification output for VM {vm.Data.Name}: {output.Message}");
+                uppercaseChars[RandomNumberGenerator.GetInt32(uppercaseChars.Length)],
+                lowercaseChars[RandomNumberGenerator.GetInt32(lowercaseChars.Length)],
+                numericChars[RandomNumberGenerator.GetInt32(numericChars.Length)],
+                specialChars[RandomNumberGenerator.GetInt32(specialChars.Length)]
+            };
+            
+            if (length < requiredChars.Count)
+                throw new ArgumentException("Password length too short to include all required character types.", nameof(length));
+
+            // Fill required characters first
+            for (int i = 0; i < requiredChars.Count; i++)
+                password[i] = requiredChars[i];
+
+            // Fill the rest with random characters from the full set
+            for (int i = requiredChars.Count; i < length; i++)
+                password[i] = allChars[RandomNumberGenerator.GetInt32(allChars.Length)];
+
+            // Shuffle the password array thoroughly using Fisher-Yates shuffle
+            for (int i = password.Length - 1; i > 0; i--)
+            {
+                int j = RandomNumberGenerator.GetInt32(i + 1);
+                (password[i], password[j]) = (password[j], password[i]); // Swap
+            }
+            
+            return new string(password);
+        }
+
+        // Configure the VM user account
+        public static async Task<bool> ConfigureVMUserAccountAsync(VirtualMachineResource vm, string password, ILogger logger)
+        {
+            logger.LogInformation($"Configuring SolidCAMOperator account on VM {vm.Data.Name}...");
+            
+            string psScript = @"$p = ConvertTo-SecureString '" + password.Replace("'", "''") + 
+                      @"' -AsPlainText -Force; $u = 'SolidCAMOperator'; try { Write-Output 'Getting user...'; " +
+                      @"$e = Get-LocalUser -Name $u -EA SilentlyContinue; if ($e) { Write-Output 'Setting pwd...'; " +
+                      @"Set-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires $true; " +
+                      @"Write-Output 'Set pwd done.'; } else { Write-Output 'Creating user...'; " +
+                      @"New-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires $true; " +
+                      @"Write-Output 'Create user done.'; } Write-Output 'Enabling user...'; " +
+                      @"Enable-LocalUser -Name $u; Write-Output 'Enable done.'; " +
+                      @"Write-Output 'Adding group member...'; " +
+                      @"Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $u -EA SilentlyContinue; " +
+                      @"Write-Output 'Add group done.'; Write-Output 'Success.'; } catch { " +
+                      @"Write-Error ""ERR: $($_.Exception.Message)""; " +
+                      @"Write-Error ""Trace: $($_.ScriptStackTrace)""; throw; }";
+            
+            var runCommandInput = new RunCommandInput("RunPowerShellScript");
+            runCommandInput.Script.Add(psScript);
+            
+            try
+            {
+                var commandStartTime = DateTime.UtcNow;
+                logger.LogInformation($"Executing account setup script on VM {vm.Data.Name}...");
+                
+                var passwordResetOperation = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                var passwordResetResult = passwordResetOperation?.Value;
+                
+                if (passwordResetResult?.Value != null && passwordResetResult.Value.Any())
+                {
+                    bool errorFound = false;
+                    foreach (var status in passwordResetResult.Value)
+                    {
+                        if (status.Level?.ToString().Equals("Error", StringComparison.OrdinalIgnoreCase) == true ||
+                            status.Message?.Contains("ERR:") == true)
+                        {
+                            errorFound = true;
+                            logger.LogError($"Error in account setup: {status.Message}");
+                        }
+                    }
+                    
+                    if (!errorFound && passwordResetResult.Value.Any(s => s.Message?.Contains("Success.") == true))
+                    {
+                        var commandEndTime = DateTime.UtcNow;
+                        var commandDuration = commandEndTime - commandStartTime;
+                        logger.LogInformation($"Successfully configured SolidCAMOperator account on VM {vm.Data.Name} in {commandDuration.TotalSeconds:F2} seconds");
+                        return true;
+                    }
+                }
+                
+                logger.LogWarning($"Failed to configure SolidCAMOperator account on VM {vm.Data.Name}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, $"Exception during account setup on VM {vm.Data.Name}");
+                return false;
             }
         }
-        
-        logger.LogInformation($"Final verification completed on VM {vm.Data.Name}");
-    }
-    catch (Exception ex)
-    {
-        logger.LogWarning(ex, $"Failed to run verification script on VM {vm.Data.Name}. Continuing with deallocation.");
-    }
-}
 
-// --- Host Startup ---
-try
-{
-    // Wait for the potentially long-running initialization task to complete
-    Console.WriteLine("Main thread: Waiting for VM Pool initialization task to complete...");
-    initializePoolTask.Wait(); // This blocks the current thread.
-    Console.WriteLine("Main thread: VM Pool initialization task has completed.");
-    
-    if (initializePoolTask.IsFaulted)
-    {
-        Console.Error.WriteLine("Main thread: VM Pool initialization task failed with errors (see logs above).");
-        // Log the exception but don't re-throw to allow the app to start
-        if (initializePoolTask.Exception != null)
+        // Store VM password in Table Storage and cache
+        public static async Task StoreVMPasswordAsync(string vmName, string password, ILogger logger)
         {
-            Console.Error.WriteLine($"Error details: {initializePoolTask.Exception.InnerException?.Message ?? "Unknown error"}");
+            // Store in memory cache
+            vmCredentialsCache[vmName] = password;
+            
+            // Store in Table Storage
+            try
+            {
+                if (credentialsTableClient != null)
+                {
+                    var entity = new TableEntity(vmName, "password")
+                    {
+                        ["PasswordValue"] = password,
+                        ["CreatedTime"] = DateTime.UtcNow
+                    };
+                    
+                    await credentialsTableClient.UpsertEntityAsync(entity);
+                    logger.LogInformation($"Successfully stored password for VM {vmName} in Table Storage");
+                }
+                else
+                {
+                    logger.LogWarning($"Table Storage client not initialized. Password for VM {vmName} only stored in memory.");
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, $"Failed to store password for VM {vmName} in Table Storage: {ex.Message}");
+            }
+        }
+
+        // Load credentials from Table Storage into memory cache
+        private static void LoadCredentialsFromTable()
+        {
+            if (credentialsTableClient == null)
+                return;
+                
+            try
+            {
+                Console.WriteLine("Loading VM credentials from Table Storage...");
+                
+                var entities = credentialsTableClient.Query<TableEntity>();
+                foreach (var entity in entities)
+                {
+                    if (entity.ContainsKey("PasswordValue"))
+                    {
+                        string vmName = entity.PartitionKey;
+                        string password = entity.GetString("PasswordValue");
+                        
+                        if (!string.IsNullOrEmpty(vmName) && !string.IsNullOrEmpty(password))
+                        {
+                            vmCredentialsCache[vmName] = password;
+                            Console.WriteLine($"Loaded credentials for VM: {vmName}");
+                        }
+                    }
+                }
+                
+                Console.WriteLine($"Loaded {vmCredentialsCache.Count} VM credentials into memory cache");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error loading VM credentials from Table Storage: {ex.Message}");
+            }
+        }
+
+        // Get VM password from cache or Table Storage
+        public static string GetVMPassword(string vmName, ILogger logger)
+        {
+            // First check in-memory cache
+            if (vmCredentialsCache.TryGetValue(vmName, out string password))
+            {
+                logger.LogInformation($"Found password for VM {vmName} in memory cache");
+                return password;
+            }
+            
+            // If not in memory, try to get from Table Storage
+            try
+            {
+                if (credentialsTableClient != null)
+                {
+                    try
+                    {
+                        var response = credentialsTableClient.GetEntity<TableEntity>(vmName, "password");
+                        if (response != null && response.Value.ContainsKey("PasswordValue"))
+                        {
+                            string storedPassword = response.Value.GetString("PasswordValue");
+                            logger.LogInformation($"Retrieved password for VM {vmName} from Table Storage");
+                            
+                            // Cache the password in memory for future requests
+                            vmCredentialsCache[vmName] = storedPassword;
+                            
+                            return storedPassword;
+                        }
+                    }
+                    catch (RequestFailedException ex) when (ex.Status == 404)
+                    {
+                        logger.LogWarning($"No password record found for VM {vmName} in Table Storage");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning($"Error retrieving password for VM {vmName} from Table Storage: {ex.Message}");
+            }
+            
+            logger.LogWarning($"No password found for VM {vmName} in memory or Table Storage");
+            return null;
         }
     }
 }
-catch (Exception ex)
-{
-    Console.Error.WriteLine($"Main thread: An error occurred while waiting for the VM pool initialization task: {ex}");
-    // Continue execution to start the host
-}
-
-Console.WriteLine("Main thread: Building Azure Functions host...");
-var host = new HostBuilder()
-    .ConfigureFunctionsWorkerDefaults()
-    .ConfigureServices(services => {
-        // You can add additional service registrations here
-    })
-    .Build();
-
-Console.WriteLine("Main thread: Starting Azure Functions host...");
-host.Run();
-
-Console.WriteLine("Main thread: Azure Functions host has shut down.");
