@@ -1,5 +1,3 @@
-// Program.cs - Optimized for faster VM pool initialization and deployment
-
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.DependencyInjection; 
 using Microsoft.Extensions.Logging;
@@ -48,14 +46,22 @@ namespace DeployVMFunction
                 .Build();
 
             // Initialize Table Storage for VM credentials
-            string storageConnectionString = configuration.GetConnectionString("AzureWebJobsStorage");
+            // Try to get connection string from multiple sources
+            string storageConnectionString = configuration.GetConnectionString("AzureWebJobsStorage") 
+                                         ?? Environment.GetEnvironmentVariable("AzureWebJobsStorage")
+                                         ?? configuration.GetValue<string>("AzureWebJobsStorage");
+            
+            Console.WriteLine($"Storage connection string found: {!string.IsNullOrEmpty(storageConnectionString)}");
+
             if (!string.IsNullOrEmpty(storageConnectionString))
             {
                 try
                 {
+                    Console.WriteLine("Initializing Table Storage client...");
                     credentialsTableClient = new TableClient(storageConnectionString, "VMCredentials");
+                    Console.WriteLine("Creating VM credentials table if it doesn't exist...");
                     credentialsTableClient.CreateIfNotExists();
-                    Console.WriteLine("Initialized VM credentials table storage");
+                    Console.WriteLine("Initialized VM credentials table storage successfully");
                     
                     // Load existing credentials into cache
                     LoadCredentialsFromTable();
@@ -63,7 +69,14 @@ namespace DeployVMFunction
                 catch (Exception ex)
                 {
                     Console.WriteLine($"Failed to initialize Table Storage for VM credentials: {ex.Message}");
+                    Console.WriteLine($"Exception type: {ex.GetType().Name}");
+                    Console.WriteLine($"Exception details: {ex}");
+                    credentialsTableClient = null; // Reset to null on failure
                 }
+            }
+            else
+            {
+                Console.WriteLine("WARNING: AzureWebJobsStorage connection string is missing. VM passwords will only be stored in memory.");
             }
 
             // Create a host builder with the necessary configuration
@@ -533,7 +546,7 @@ Write-Output ""Done with initialization.""
             }
         }
 
-        // Store VM password in Table Storage and cache
+        // Store VM password in Table Storage and cache - Updated with better error handling
         public static async Task StoreVMPasswordAsync(string vmName, string password, ILogger logger)
         {
             // Store in memory cache
@@ -550,8 +563,17 @@ Write-Output ""Done with initialization.""
                         ["CreatedTime"] = DateTime.UtcNow
                     };
                     
-                    await credentialsTableClient.UpsertEntityAsync(entity);
-                    logger.LogInformation($"Successfully stored password for VM {vmName} in Table Storage");
+                    try
+                    {
+                        logger.LogInformation($"Storing password for VM {vmName} in Table Storage...");
+                        await credentialsTableClient.UpsertEntityAsync(entity);
+                        logger.LogInformation($"Successfully stored password for VM {vmName} in Table Storage");
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex, $"Error during UpsertEntityAsync operation: {ex.Message}");
+                        throw;
+                    }
                 }
                 else
                 {
@@ -564,7 +586,7 @@ Write-Output ""Done with initialization.""
             }
         }
 
-        // Load credentials from Table Storage into memory cache
+        // Load credentials from Table Storage into memory cache - Updated with better error handling
         private static void LoadCredentialsFromTable()
         {
             if (credentialsTableClient == null)
@@ -574,31 +596,43 @@ Write-Output ""Done with initialization.""
             {
                 Console.WriteLine("Loading VM credentials from Table Storage...");
                 
-                var entities = credentialsTableClient.Query<TableEntity>();
-                foreach (var entity in entities)
+                try
                 {
-                    if (entity.ContainsKey("PasswordValue"))
+                    var entities = credentialsTableClient.Query<TableEntity>();
+                    int loadedCount = 0;
+                    
+                    foreach (var entity in entities)
                     {
-                        string vmName = entity.PartitionKey;
-                        string password = entity.GetString("PasswordValue");
-                        
-                        if (!string.IsNullOrEmpty(vmName) && !string.IsNullOrEmpty(password))
+                        if (entity.ContainsKey("PasswordValue"))
                         {
-                            vmCredentialsCache[vmName] = password;
-                            Console.WriteLine($"Loaded credentials for VM: {vmName}");
+                            string vmName = entity.PartitionKey;
+                            string password = entity.GetString("PasswordValue");
+                            
+                            if (!string.IsNullOrEmpty(vmName) && !string.IsNullOrEmpty(password))
+                            {
+                                vmCredentialsCache[vmName] = password;
+                                loadedCount++;
+                                Console.WriteLine($"Loaded credentials for VM: {vmName}");
+                            }
                         }
                     }
+                    
+                    Console.WriteLine($"Loaded {loadedCount} VM credentials into memory cache");
                 }
-                
-                Console.WriteLine($"Loaded {vmCredentialsCache.Count} VM credentials into memory cache");
+                catch (RequestFailedException ex) when (ex.Status == 404)
+                {
+                    Console.WriteLine("VM credentials table doesn't exist yet. Will be created when first VM is configured.");
+                }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error loading VM credentials from Table Storage: {ex.Message}");
+                Console.WriteLine($"Exception type: {ex.GetType().Name}");
+                Console.WriteLine($"Exception details: {ex}");
             }
         }
 
-        // Get VM password from cache or Table Storage
+        // Get VM password from cache or Table Storage - Updated with better error handling
         public static string GetVMPassword(string vmName, ILogger logger)
         {
             // First check in-memory cache
@@ -615,7 +649,9 @@ Write-Output ""Done with initialization.""
                 {
                     try
                     {
+                        logger.LogInformation($"Attempting to retrieve password for VM {vmName} from Table Storage");
                         var response = credentialsTableClient.GetEntity<TableEntity>(vmName, "password");
+                        
                         if (response != null && response.Value.ContainsKey("PasswordValue"))
                         {
                             string storedPassword = response.Value.GetString("PasswordValue");
@@ -626,16 +662,25 @@ Write-Output ""Done with initialization.""
                             
                             return storedPassword;
                         }
+                        else
+                        {
+                            logger.LogWarning($"Password record found for VM {vmName} in Table Storage but it's missing the PasswordValue field");
+                        }
                     }
                     catch (RequestFailedException ex) when (ex.Status == 404)
                     {
                         logger.LogWarning($"No password record found for VM {vmName} in Table Storage");
                     }
                 }
+                else
+                {
+                    logger.LogWarning($"Table Storage client is null. Cannot retrieve password for VM {vmName} from Table Storage");
+                }
             }
             catch (Exception ex)
             {
                 logger.LogWarning($"Error retrieving password for VM {vmName} from Table Storage: {ex.Message}");
+                logger.LogWarning($"Exception type: {ex.GetType().Name}");
             }
             
             logger.LogWarning($"No password found for VM {vmName} in memory or Table Storage");
