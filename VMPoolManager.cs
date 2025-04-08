@@ -383,7 +383,7 @@ namespace DeployVMFunction
         }
 
         /// <summary>
-        /// Creates a new VM (NSG, NIC, VM) and immediately deallocates it.
+        /// Creates a new VM (NSG, NIC, VM) with configured password and then deallocates it.
         /// Intended for adding VMs to the pool.
         /// </summary>
         public async Task<VirtualMachineResource> CreatePoolVMAsync()
@@ -394,7 +394,7 @@ namespace DeployVMFunction
             var nicName = $"vm-nic-pool-{timestamp}";
             var nsgName = $"vm-nsg-pool-{timestamp}";
 
-            _logger.LogInformation($"Creating new DEALLOCATED pool VM: {vmName}");
+            _logger.LogInformation($"Creating new pool VM with configured password: {vmName}");
 
             // For cleanup in case of failure
             NetworkSecurityGroupResource? nsg = null;
@@ -464,7 +464,20 @@ namespace DeployVMFunction
                             {
                                 HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption },
                                 NetworkProfile = new VirtualMachineNetworkProfile() { NetworkInterfaces = { new VirtualMachineNetworkInterfaceReference() { Id = nic.Id, Primary = true } } },
-                                StorageProfile = new VirtualMachineStorageProfile() { ImageReference = new ImageReference() { Id = imageResourceId } },
+                                StorageProfile = new VirtualMachineStorageProfile()
+                                { 
+                                    ImageReference = new ImageReference() { Id = imageResourceId },
+                                    OsDisk = new OSDiskData()
+                                    {
+                                        Caching = CachingType.ReadOnly,
+                                        DiffDiskSettings = new DiffDiskSettings 
+                                        { 
+                                            Option = DiffDiskOption.Local, // This enables ephemeral OS disk
+                                            Placement = DiffDiskPlacement.CacheDisk
+                                        },
+                                        CreateOption = DiskCreateOption.FromImage
+                                    }
+                                },
                                 SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch }
                             };
                             _logger.LogInformation($"Creating pool VM: {vmName} using image {_galleryImageId}");
@@ -473,10 +486,32 @@ namespace DeployVMFunction
                             VirtualMachineResource vm = vmCreateOp.Value;
                             _logger.LogInformation($"VM creation completed for pool VM: {vm.Data.Name}");
 
-                            // Immediately deallocate the VM to save costs and add it to the pool correctly
+                            // Configure the user account while the VM is running (OPTIMIZATION)
+                            _logger.LogInformation($"Configuring user account for VM {vm.Data.Name} while running...");
+                            
+                            // Wait for a short time to ensure VM is fully running and services are up
+                            _logger.LogInformation($"Allowing brief initialization time for VM {vm.Data.Name}...");
+                            await Task.Delay(TimeSpan.FromSeconds(30));
+                            
+                            // Generate and configure the password
+                            string password = Program.GenerateSecurePassword(16);
+                            bool configSuccess = await Program.ConfigureVMUserAccountAsync(vm, password, _logger);
+                            
+                            if (configSuccess)
+                            {
+                                // Store the password for future use
+                                await Program.StoreVMPasswordAsync(vm.Data.Name, password, _logger);
+                                _logger.LogInformation($"Successfully configured user account for VM {vm.Data.Name}");
+                            }
+                            else
+                            {
+                                _logger.LogWarning($"Failed to configure user account for VM {vm.Data.Name}. VM will still be added to pool.");
+                            }
+
+                            // Now deallocate the VM (only once)
                             _logger.LogInformation($"Deallocating pool VM: {vmName}");
                             await vm.DeallocateAsync(Azure.WaitUntil.Completed);
-                            _logger.LogInformation($"Pool VM deallocated: {vmName}");
+                            _logger.LogInformation($"Pool VM deallocated: {vmName} and ready for use");
 
                             // Update the default VM size and location if a fallback worked
                             if (!vmSizeOption.ToString().Equals(_vmSize.ToString(), StringComparison.OrdinalIgnoreCase))
@@ -655,7 +690,20 @@ namespace DeployVMFunction
                             {
                                 HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption },
                                 NetworkProfile = new VirtualMachineNetworkProfile() { NetworkInterfaces = { new VirtualMachineNetworkInterfaceReference() { Id = nic.Id, Primary = true } } },
-                                StorageProfile = new VirtualMachineStorageProfile() { ImageReference = new ImageReference() { Id = imageResourceId } },
+                                StorageProfile = new VirtualMachineStorageProfile()
+                                { 
+                                    ImageReference = new ImageReference() { Id = imageResourceId },
+                                    OsDisk = new OSDiskData()
+                                    {
+                                        Caching = CachingType.ReadOnly,
+                                        DiffDiskSettings = new DiffDiskSettings 
+                                        { 
+                                            Option = DiffDiskOption.Local, // This enables ephemeral OS disk
+                                            Placement = DiffDiskPlacement.CacheDisk
+                                        },
+                                        CreateOption = DiskCreateOption.FromImage
+                                    }
+                                },
                                 SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch }
                             };
                             _logger.LogInformation($"Creating VM: {vmName} using image {_galleryImageId}");
@@ -786,14 +834,28 @@ namespace DeployVMFunction
                     _logger.LogInformation($"VM {vmToStart.Data.Name} started successfully.");
                     vmToReturn = vmToStart; // Assign the started VM to return
 
-                    // UPDATED: Don't replenish immediately, just log status
-                    // Log the remaining pool size but don't replenish immediately
-                    _logger.LogInformation($"Pool now has {poolStatus.DeallocatedVMs.Count - 1} deallocated VMs remaining.");
+                    // Check if we need to replenish the pool (if we have fewer than 3 VMs remaining after allocation)
+                    int remainingVMs = poolStatus.DeallocatedVMs.Count - 1;
+                    _logger.LogInformation($"Pool now has {remainingVMs} deallocated VMs remaining.");
                     
-                    // Only log if pool is below minimum (next scheduled maintenance will handle replenishment)
-                    if ((poolStatus.DeallocatedVMs.Count - 1) < _minPoolSize)
+                    const int replenishThreshold = 2; // Replenish when 2 or fewer VMs remain
+                    if (remainingVMs <= replenishThreshold)
                     {
-                        _logger.LogInformation($"Remaining pool size {poolStatus.DeallocatedVMs.Count - 1} is below minimum {_minPoolSize}. Will be replenished during next scheduled maintenance.");
+                        _logger.LogInformation($"Remaining pool size {remainingVMs} is at or below threshold of {replenishThreshold}. Starting background task to create a new VM for the pool.");
+                        
+                        // Start a background task to create a new VM for the pool in parallel
+                        _ = Task.Run(async () => {
+                            try
+                            {
+                                _logger.LogInformation("Background task: Creating a new VM for the pool...");
+                                await CreatePoolVMAsync();
+                                _logger.LogInformation("Background task: Successfully created a new VM for the pool.");
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Background task: Error creating new VM for the pool.");
+                            }
+                        });
                     }
                 }
 

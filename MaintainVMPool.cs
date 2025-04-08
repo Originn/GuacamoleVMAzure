@@ -87,38 +87,10 @@ namespace DeployVMFunction
                 {
                     logger.LogInformation($"Creating pool VM {i+1} of {needed}...");
                     
-                    // Use the VMPoolManager to create a new VM
+                    // Use the VMPoolManager to create a new VM with password already configured
                     var vm = await poolManager.CreatePoolVMAsync();
                     logger.LogInformation($"Successfully created pool VM: {vm.Data.Name}");
-                    
-                    // Before deallocating, we need to start the VM to configure the user account
-                    logger.LogInformation($"Starting VM {vm.Data.Name} to configure user account...");
-                    await vm.PowerOnAsync(Azure.WaitUntil.Completed);
-                    
-                    // Wait for the VM to be ready
-                    logger.LogInformation($"Waiting for VM {vm.Data.Name} to be ready...");
-                    await Task.Delay(TimeSpan.FromSeconds(60)); // Give it a minute to start up
-                    
-                    // Generate and configure the user account
-                    string password = Program.GenerateSecurePassword(16);
-                    bool configSuccess = await Program.ConfigureVMUserAccountAsync(vm, password, logger);
-                    
-                    if (configSuccess)
-                    {
-                        // Store the password for future use
-                        await Program.StoreVMPasswordAsync(vm.Data.Name, password, logger);
-                        logger.LogInformation($"Successfully configured user account for VM {vm.Data.Name}");
-                        newVMs.Add(vm);
-                    }
-                    else
-                    {
-                        logger.LogWarning($"Failed to configure user account for VM {vm.Data.Name}");
-                    }
-                    
-                    // Deallocate the VM to return it to the pool
-                    logger.LogInformation($"Deallocating VM {vm.Data.Name}...");
-                    await vm.DeallocateAsync(Azure.WaitUntil.Completed);
-                    logger.LogInformation($"VM {vm.Data.Name} deallocated and added to pool");
+                    newVMs.Add(vm);
                 }
                 catch (Exception ex)
                 {
@@ -126,7 +98,7 @@ namespace DeployVMFunction
                 }
             }
             
-            logger.LogInformation($"Successfully created and configured {newVMs.Count} out of {needed} VMs");
+            logger.LogInformation($"Successfully created {newVMs.Count} out of {needed} VMs");
         }
         
         /// <summary>
