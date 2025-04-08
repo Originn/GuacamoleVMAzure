@@ -83,15 +83,12 @@ namespace DeployVMFunction
                 _ => AzureLocation.NorthEurope,
             };
             
-            // Define location fallback options with good distance between regions to avoid regional outages
+            // Define location fallback options with westeurope and israelcentral only
             _locationFallbackOptions = new List<AzureLocation>
             {
-                _location,                  // Primary location first
-                AzureLocation.WestEurope,   // West Europe
-                AzureLocation.UKSouth,      // UK South
-                AzureLocation.FranceCentral, // France Central
-                AzureLocation.GermanyWestCentral, // Germany West Central
-                AzureLocation.NorthEurope   // North Europe (if not already primary)
+                _location,                   // Primary location first (from AZURE_LOCATION env var)
+                AzureLocation.WestEurope,    // West Europe as first fallback
+                AzureLocation.IsraelCentral  // Israel Central as second fallback
             };
             
             // Remove duplicates and ensure current location is first
@@ -106,43 +103,18 @@ namespace DeployVMFunction
             var vmSizeString = Environment.GetEnvironmentVariable("VM_SIZE") ?? "Standard_D2s_v3";
             _vmSize = new VirtualMachineSizeType(vmSizeString);
 
-            // Define fallback VM sizes that are compatible with Generation 2 Hypervisor
-            // UPDATED: Only include verified 1-CPU options that are Generation 2 compatible
+            // Only use the specified VM size without fallbacks
             _vmSizeFallbackOptions = new List<VirtualMachineSizeType>
             {
-                new VirtualMachineSizeType("Standard_B1ls"),    // 1 vCPU, Gen2 compatible
-                new VirtualMachineSizeType("Standard_B1s"),     // 1 vCPU, Gen2 compatible
-                new VirtualMachineSizeType("Standard_B1ms"),    // 1 vCPU, Gen2 compatible
-                new VirtualMachineSizeType("Standard_DS1_v2"),  // 1 vCPU, Gen2 compatible
-                new VirtualMachineSizeType("Standard_D2s_v3"),  // 2 vCPUs, Gen2 compatible
-                new VirtualMachineSizeType("Standard_D4s_v3"),  // 4 vCPUs, Gen2 compatible
-                new VirtualMachineSizeType("Standard_D2s_v4"),  // 2 vCPUs, Gen2 compatible
-                new VirtualMachineSizeType("Standard_D4s_v4"),  // 4 vCPUs, Gen2 compatible
-                new VirtualMachineSizeType("Standard_D2s_v5"),  // 2 vCPUs, Gen2 compatible
-                new VirtualMachineSizeType("Standard_D2as_v4")  // 2 vCPUs, AMD-based, Gen2 compatible
+                _vmSize  // Only use the VM size specified in VM_SIZE environment variable
             };
 
-            // Ensure the user-configured VM size is tried first if it's not in the list
-            bool hasConfiguredSize = _vmSizeFallbackOptions.Any(s => s.ToString() == _vmSize.ToString());
-            if (!hasConfiguredSize)
-            {
-                _vmSizeFallbackOptions.Insert(0, _vmSize);
-            }
-            else
-            {
-                // If it's in the list, move it to the front
-                _vmSizeFallbackOptions.RemoveAll(s => s.ToString() == _vmSize.ToString());
-                _vmSizeFallbackOptions.Insert(0, _vmSize);
-            }
-
-            _logger.LogInformation($"Configured VM size: {_vmSize}, with {_vmSizeFallbackOptions.Count} fallback options");
-
+            _logger.LogInformation($"Using VM size: {_vmSize} from environment variable VM_SIZE='{Environment.GetEnvironmentVariable("VM_SIZE")}'");
             if (string.IsNullOrEmpty(_guacamoleServerPrivateIp))
             {
                 _logger.LogError("GUACAMOLE_SERVER_PRIVATE_IP environment variable is not set.");
                 throw new InvalidOperationException("GUACAMOLE_SERVER_PRIVATE_IP must be configured.");
             }
-
             // Initialize Azure Resource Manager client
             var credential = new DefaultAzureCredential(); 
             _armClient = new ArmClient(credential);
@@ -460,25 +432,26 @@ namespace DeployVMFunction
                             // Create VM with current VM size option
                             _logger.LogInformation($"Preparing VM configuration for pool VM {vmName} with size {vmSizeOption} in location {locationOption}...");
                             var imageResourceId = new ResourceIdentifier(_galleryImageId);
-                            var vmData = new VirtualMachineData(locationOption)
+                            var vmData = new VirtualMachineData(locationOption) // Use current location option
                             {
-                                HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption },
-                                NetworkProfile = new VirtualMachineNetworkProfile() { NetworkInterfaces = { new VirtualMachineNetworkInterfaceReference() { Id = nic.Id, Primary = true } } },
-                                StorageProfile = new VirtualMachineStorageProfile()
-                                { 
-                                    ImageReference = new ImageReference() { Id = imageResourceId },
-                                    OsDisk = new OSDiskData()
+                                HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption }, // Use current size option
+                                NetworkProfile = new VirtualMachineNetworkProfile() {
+                                    NetworkInterfaces = { new VirtualMachineNetworkInterfaceReference() { Id = nic.Id, Primary = true } }
+                                },
+                                StorageProfile = new VirtualMachineStorageProfile() {
+                                    ImageReference = new ImageReference() { Id = new ResourceIdentifier(_galleryImageId) },
+                                    OSDisk = new VirtualMachineOSDisk(DiskCreateOptionType.FromImage) // Ensure OS disk is specified
                                     {
-                                        Caching = CachingType.ReadOnly,
-                                        DiffDiskSettings = new DiffDiskSettings 
-                                        { 
-                                            Option = DiffDiskOption.Local, // This enables ephemeral OS disk
-                                            Placement = DiffDiskPlacement.CacheDisk
-                                        },
-                                        CreateOption = DiskCreateOption.FromImage
+                                        // Optional: Specify disk size, type (e.g., Premium_LRS), caching
+                                        Caching = CachingType.ReadWrite, // Common default
+                                        ManagedDisk = new VirtualMachineManagedDisk()
+                                        {
+                                            StorageAccountType = StorageAccountType.StandardLrs  // Or Standard_LRS, StandardSSD_LRS etc. based on image/requirements
+                                        }
                                     }
                                 },
-                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch }
+                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch } // Assuming Trusted Launch is desired/compatible
+                                // OSProfile might be needed if the image doesn't have embedded creds/setup (unlikely for gallery images)
                             };
                             _logger.LogInformation($"Creating pool VM: {vmName} using image {_galleryImageId}");
                             var vmCollection = _resourceGroup.GetVirtualMachines();
@@ -686,25 +659,26 @@ namespace DeployVMFunction
                             // Create VM with current VM size option
                             _logger.LogInformation($"Preparing VM configuration for VM: {vmName} with size {vmSizeOption} in location {locationOption}...");
                             var imageResourceId = new ResourceIdentifier(_galleryImageId);
-                            var vmData = new VirtualMachineData(locationOption)
+                            var vmData = new VirtualMachineData(locationOption) // Use current location option
                             {
-                                HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption },
-                                NetworkProfile = new VirtualMachineNetworkProfile() { NetworkInterfaces = { new VirtualMachineNetworkInterfaceReference() { Id = nic.Id, Primary = true } } },
-                                StorageProfile = new VirtualMachineStorageProfile()
-                                { 
-                                    ImageReference = new ImageReference() { Id = imageResourceId },
-                                    OsDisk = new OSDiskData()
+                                HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption }, // Use current size option
+                                NetworkProfile = new VirtualMachineNetworkProfile() {
+                                    NetworkInterfaces = { new VirtualMachineNetworkInterfaceReference() { Id = nic.Id, Primary = true } }
+                                },
+                                StorageProfile = new VirtualMachineStorageProfile() {
+                                    ImageReference = new ImageReference() { Id = new ResourceIdentifier(_galleryImageId) },
+                                    OSDisk = new VirtualMachineOSDisk(DiskCreateOptionType.FromImage) // Ensure OS disk is specified
                                     {
-                                        Caching = CachingType.ReadOnly,
-                                        DiffDiskSettings = new DiffDiskSettings 
-                                        { 
-                                            Option = DiffDiskOption.Local, // This enables ephemeral OS disk
-                                            Placement = DiffDiskPlacement.CacheDisk
-                                        },
-                                        CreateOption = DiskCreateOption.FromImage
+                                        // Optional: Specify disk size, type (e.g., Premium_LRS), caching
+                                        Caching = CachingType.ReadWrite, // Common default
+                                        ManagedDisk = new VirtualMachineManagedDisk()
+                                        {
+                                            StorageAccountType = StorageAccountType.StandardLrs  // Or Standard_LRS, StandardSSD_LRS etc. based on image/requirements
+                                        }
                                     }
                                 },
-                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch }
+                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch } // Assuming Trusted Launch is desired/compatible
+                                // OSProfile might be needed if the image doesn't have embedded creds/setup (unlikely for gallery images)
                             };
                             _logger.LogInformation($"Creating VM: {vmName} using image {_galleryImageId}");
                             var vmCollection = _resourceGroup.GetVirtualMachines();
