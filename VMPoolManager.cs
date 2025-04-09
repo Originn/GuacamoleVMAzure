@@ -13,10 +13,12 @@ using Azure.ResourceManager.Network.Models;
 using Azure.Core;
 using Azure;
 
+
 namespace DeployVMFunction
 {
     public class VMPoolManager
     {
+        private readonly string _storageConnectionString;
         private readonly ILogger _logger;
         private readonly ArmClient _armClient;
         private readonly ResourceGroupResource _resourceGroup;
@@ -35,6 +37,8 @@ namespace DeployVMFunction
         public VMPoolManager(ILogger logger)
         {
             _logger = logger;
+            _storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage") ?? 
+                throw new InvalidOperationException("AzureWebJobsStorage connection string is required");
             
             // Read MIN_POOL_SIZE from environment variable, defaulting to 1 if not set or invalid
             if (!int.TryParse(Environment.GetEnvironmentVariable("MIN_POOL_SIZE"), out _minPoolSize) || _minPoolSize < 1)
@@ -129,6 +133,93 @@ namespace DeployVMFunction
             _resourceGroup = subscription.GetResourceGroup(resourceGroupName);
 
             _logger.LogInformation($"VMPoolManager initialized. Target RG: {_resourceGroup.Id}, Location: {_location}, Pool Size: {_minPoolSize}");
+        }
+
+        private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
+        {
+            _logger.LogInformation($"Running persistent optimization for VM {vm.Data.Name}...");
+            
+            string optimizationScript = @"
+        # PERSISTENT OPTIMIZATION SCRIPT
+        # These changes will survive VM deallocation
+
+        Write-Output ""Starting persistent VM optimizations...""
+
+        # 1. Configure Windows boot settings for faster startup
+        Write-Output ""Optimizing boot configuration...""
+        bcdedit /set bootmenupolicy standard
+        bcdedit /set {current} bootstatuspolicy ignoreallfailures
+        bcdedit /timeout 3
+
+        # 2. Configure services for faster RDP startup
+        Write-Output ""Optimizing service configuration...""
+        Set-Service -Name TermService -StartupType Automatic
+        Set-Service -Name LanmanServer -StartupType Automatic
+        Set-Service -Name SessionEnv -StartupType Automatic
+        Set-Service -Name UmRdpService -StartupType Automatic
+        Set-Service -Name TermService -Status Running
+
+        # 3. Registry optimizations for RDP and startup
+        Write-Output ""Applying registry optimizations...""
+        # Enable RDP connection optimization
+        reg add ""HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"" /v fDenyTSConnections /t REG_DWORD /d 0 /f
+        reg add ""HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"" /v SecurityLayer /t REG_DWORD /d 1 /f
+        reg add ""HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"" /v UserAuthentication /t REG_DWORD /d 0 /f
+
+        # Disable unnecessary visual effects
+        reg add ""HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"" /v VisualFXSetting /t REG_DWORD /d 2 /f
+        reg add ""HKCU\Control Panel\Desktop"" /v UserPreferencesMask /t REG_BINARY /d 9012078010000000 /f
+        reg add ""HKCU\Control Panel\Desktop\WindowMetrics"" /v MinAnimate /t REG_SZ /d 0 /f
+
+        # Optimize system responsiveness
+        reg add ""HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"" /v SystemResponsiveness /t REG_DWORD /d 0 /f
+
+        # 4. Disable unnecessary startup items
+        Write-Output ""Disabling unnecessary startup items...""
+        Get-ScheduledTask | Where-Object {
+            $_.State -eq ""Ready"" -and 
+            ($_.TaskPath -like ""*\Startup\*"" -or $_.TaskName -like ""*OneDrive*"" -or $_.TaskName -like ""*Skype*"")
+        } | Disable-ScheduledTask -ErrorAction SilentlyContinue
+
+        # 5. Run SolidCAM-specific optimization if needed
+        $solidcamPath = ""C:\Program Files\SolidCAM""
+        if (Test-Path $solidcamPath) {
+            Write-Output ""Optimizing SolidCAM configuration...""
+            # Create pre-cached config if needed
+            if (Test-Path ""$solidcamPath\config"") {
+                Copy-Item ""$solidcamPath\config"" ""$solidcamPath\config.cached"" -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # 6. Schedule a quick optimization task that runs at Windows startup 
+        Write-Output ""Creating startup optimization task...""
+        $action = New-ScheduledTaskAction -Execute 'Powershell.exe' -Argument '-NoProfile -WindowStyle Hidden -Command ""& {ipconfig /flushdns; Get-Service TermService | Restart-Service -Force}""'
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName ""SolidCAM-StartupOptimizer"" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
+
+        Write-Output ""Persistent VM optimization completed.""
+        ";
+
+            var runCommandInput = new RunCommandInput("RunPowerShellScript");
+            runCommandInput.Script.Add(optimizationScript);
+            
+            try {
+                var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                _logger.LogInformation($"Persistent optimization completed for VM {vm.Data.Name}");
+                
+                if (result?.Value?.Value != null) {
+                    foreach (var output in result.Value.Value) {
+                        if (output.Message?.Contains("error", StringComparison.OrdinalIgnoreCase) == true) {
+                            _logger.LogWarning($"Optimization warning for VM {vm.Data.Name}: {output.Message}");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) {
+                _logger.LogWarning(ex, $"Persistent optimization encountered issues for VM {vm.Data.Name}, but continuing with deallocation");
+            }
         }
 
         /// <summary>
@@ -322,28 +413,37 @@ namespace DeployVMFunction
 
             if (needed > 0)
             {
-                _logger.LogInformation($"Pool requires {needed} more deallocated VM(s). Creating them now.");
+                _logger.LogInformation($"Pool requires {needed} more deallocated VM(s). Creating them in parallel.");
 
-                // Create VMs one at a time (sequentially) to better handle and report errors
+                // Create a list to hold the VM creation tasks
+                var creationTasks = new List<Task<VirtualMachineResource>>();
+                
+                // Start all VM creation tasks in parallel
                 for (int i = 0; i < needed; i++)
                 {
-                    try
-                    {
-                        _logger.LogInformation($"Creating pool VM {i+1} of {needed}");
-                        await CreatePoolVMAsync();
-                        _logger.LogInformation($"Successfully created pool VM {i+1} of {needed}");
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, $"Failed to create pool VM {i+1} of {needed}");
-                        // Continue with next VM even if this one failed
-                    }
+                    int vmIndex = i; // Capture for logging in the task
+                    creationTasks.Add(Task.Run(async () => {
+                        try
+                        {
+                            _logger.LogInformation($"Starting parallel creation of pool VM {vmIndex+1} of {needed}");
+                            var vm = await CreatePoolVMAsync();
+                            _logger.LogInformation($"Successfully created pool VM {vmIndex+1} of {needed}: {vm.Data.Name}");
+                            return vm;
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, $"Failed to create pool VM {vmIndex+1} of {needed}");
+                            return null;
+                        }
+                    }));
                 }
                 
-                // Re-check the pool status to see how many were actually created
-                var updatedStatus = await GetPoolStatusAsync();
-                int actuallyCreated = updatedStatus.DeallocatedVMs.Count - poolStatus.DeallocatedVMs.Count;
-                _logger.LogInformation($"Successfully created {actuallyCreated} out of {needed} requested pool VMs.");
+                // Wait for all VM creation tasks to complete
+                var results = await Task.WhenAll(creationTasks);
+                
+                // Count successful creations
+                int successCount = results.Count(vm => vm != null);
+                _logger.LogInformation($"Successfully created {successCount} out of {needed} requested pool VMs in parallel.");
                 
                 // Clean up any orphaned resources that might have been created during failures
                 await CleanupOrphanedResourcesAsync();
@@ -480,6 +580,9 @@ namespace DeployVMFunction
                             {
                                 _logger.LogWarning($"Failed to configure user account for VM {vm.Data.Name}. VM will still be added to pool.");
                             }
+
+                            _logger.LogInformation($"Running persistent optimization before deallocating pool VM: {vmName}");
+                            await OptimizeVMForFasterStartupAsync(vm);
 
                             // Now deallocate the VM (only once)
                             _logger.LogInformation($"Deallocating pool VM: {vmName}");
@@ -765,86 +868,108 @@ namespace DeployVMFunction
         public async Task<VirtualMachineResource> AllocateVMFromPoolAsync()
         {
             _logger.LogInformation("Allocating VM from pool");
+            VirtualMachineResource vmToStart = null;
 
+            // LOCK SCOPE REDUCTION: Only use lock for the VM selection process
+            await using var vmAllocationLock = new DistributedLock(
+            _storageConnectionString, 
+            "vm-allocation-locks", 
+            "pool-allocation-lock", 
+            _logger);
+
+        // Add retry logic with exponential backoff
+        int maxRetries = 5;
+        int retryDelay = 1000; // ms
+        bool lockAcquired = false;
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
             try
             {
-                var poolStatus = await GetPoolStatusAsync();
-
-                VirtualMachineResource vmToReturn; // Declare VM to return
-
-                if (poolStatus.DeallocatedVMs.Count == 0)
+                // Try to acquire lock
+                if (await vmAllocationLock.AcquireAsync(15)) // 15 seconds is minimum valid lease time
                 {
-                    // SCENARIO 1: POOL EMPTY
-                    _logger.LogWarning("No deallocated VMs available in pool. Creating a new RUNNING VM for user.");
-
-                    // 1. Create the running VM for the user
-                    vmToReturn = await CreateAndReturnRunningVMAsync("user");
-                    _logger.LogInformation($"Created running VM for user: {vmToReturn.Data.Name}");
-
-                    // 2. Start a SINGLE background task to maintain the pool
-                    _logger.LogInformation($"Starting background task to maintain pool at minimum size ({_minPoolSize}).");
-                    _ = Task.Run(async () => {
-                        try
-                        {
-                            // This will create exactly the number of VMs needed to reach MIN_POOL_SIZE
-                            await EnsurePoolSizeAsync();
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Error in background pool maintenance task.");
-                        }
-                    });
+                    lockAcquired = true;
+                    _logger.LogInformation($"Lock acquired on attempt {attempt}");
+                    break; // Lock acquired, proceed with VM allocation
                 }
-                else
+                
+                // If we couldn't acquire the lock
+                if (attempt < maxRetries)
                 {
-                    // SCENARIO 2: POOL NOT EMPTY
-                    _logger.LogInformation($"Found {poolStatus.DeallocatedVMs.Count} deallocated VM(s) in pool. Starting one.");
-                    // Take the first deallocated VM
-                    var vmToStart = poolStatus.DeallocatedVMs[0];
-                    _logger.LogInformation($"Starting VM from pool: {vmToStart.Data.Name}");
-                    
-                    // Start the VM and wait for the operation to complete
-                    await vmToStart.PowerOnAsync(Azure.WaitUntil.Completed);
-                    _logger.LogInformation($"VM {vmToStart.Data.Name} started successfully.");
-                    vmToReturn = vmToStart; // Assign the started VM to return
-
-                    // Check if we need to replenish the pool (if we have fewer than 3 VMs remaining after allocation)
-                    int remainingVMs = poolStatus.DeallocatedVMs.Count - 1;
-                    _logger.LogInformation($"Pool now has {remainingVMs} deallocated VMs remaining.");
-                    
-                    const int replenishThreshold = 2; // Replenish when 2 or fewer VMs remain
-                    if (remainingVMs <= replenishThreshold)
-                    {
-                        _logger.LogInformation($"Remaining pool size {remainingVMs} is at or below threshold of {replenishThreshold}. Starting background task to create a new VM for the pool.");
-                        
-                        // Start a background task to create a new VM for the pool in parallel
-                        _ = Task.Run(async () => {
-                            try
-                            {
-                                _logger.LogInformation("Background task: Creating a new VM for the pool...");
-                                await CreatePoolVMAsync();
-                                _logger.LogInformation("Background task: Successfully created a new VM for the pool.");
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogError(ex, "Background task: Error creating new VM for the pool.");
-                            }
-                        });
-                    }
+                    _logger.LogInformation($"Lock acquisition attempt {attempt} failed, waiting for {retryDelay}ms before retry");
+                    await Task.Delay(retryDelay);
+                    retryDelay *= 2; // Exponential backoff
                 }
-
-                // Return the VM assigned to the user (either newly created or started from pool)
-                _logger.LogInformation($"Returning VM {vmToReturn.Data.Name} for user assignment.");
-                return vmToReturn;
             }
             catch (Exception ex)
             {
-                // Log the exception details
-                _logger.LogError(ex, "Unhandled error during VM allocation process.");
-                throw; // Rethrow the exception so the calling function knows something went wrong
+                _logger.LogWarning($"Error during lock acquisition attempt {attempt}: {ex.Message}");
+                if (attempt < maxRetries)
+                {
+                    _logger.LogInformation($"Waiting {retryDelay}ms before retry after error");
+                    await Task.Delay(retryDelay);
+                    retryDelay *= 2;
+                }
+                else if (attempt == maxRetries)
+                {
+                    throw;
+                }
+            }
+        }
+
+        // Check if lock was acquired after all retry attempts
+        if (!lockAcquired)
+        {
+            _logger.LogWarning($"Could not acquire lock for VM allocation after {maxRetries} attempts.");
+            throw new InvalidOperationException("Failed to acquire lock for VM allocation. Please try again in a few moments.");
+        }
+
+            // LOCK SCOPE REDUCTION: Only use lock for the VM selection process
+                try
+                {
+                    // Get current pool status
+                    var poolStatus = await GetPoolStatusAsync();
+
+                    if (poolStatus.DeallocatedVMs.Count > 0)
+                    {
+                        // Select a VM from the pool (fast operation)
+                        vmToStart = poolStatus.DeallocatedVMs[0];
+                        _logger.LogInformation($"Selected VM from pool: {vmToStart.Data.Name}");
+                        
+                        // Launch background pool maintenance if needed
+                        if (poolStatus.DeallocatedVMs.Count - 1 <= 2)
+                        {
+                            _ = Task.Run(async () => {
+                                try {
+                                    await EnsurePoolSizeAsync();
+                                } catch (Exception ex) {
+                                    _logger.LogError(ex, "Pool maintenance error");
+                                }
+                            });
+                        }
+                    }
+                }
+                finally
+                {
+                    // Lock is released automatically when leaving this block
+                }
+
+            // Start VM OUTSIDE the lock
+            if (vmToStart != null)
+            {
+                _logger.LogInformation($"Starting VM from pool: {vmToStart.Data.Name}");
+                await vmToStart.PowerOnAsync(Azure.WaitUntil.Completed);
+                return vmToStart;
+            }
+            else
+            {
+                // Create new VM if pool is empty (also outside lock)
+                return await CreateAndReturnRunningVMAsync("user");
             }
         }
     }
+    
 
     /// <summary>
     /// Represents the status of the VM pool.
