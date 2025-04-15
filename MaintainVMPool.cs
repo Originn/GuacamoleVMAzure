@@ -5,6 +5,8 @@ using System.Linq;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using Azure.ResourceManager.Compute;
+using Azure.ResourceManager.Compute.Models;
+using Azure;
 
 namespace DeployVMFunction
 {
@@ -30,7 +32,6 @@ namespace DeployVMFunction
                                      $"{poolStatus.RunningVMs.Count} running VMs, " +
                                      $"{poolStatus.TransitioningVMs.Count} transitioning VMs, " +
                                      $"{poolStatus.OtherVMs.Count} other SolidCAM VMs");
-                
                 // Check for VMs without configured passwords
                 logger.LogInformation("Checking if existing pool VMs need password configuration...");
                 await ConfigureExistingVMsAsync(poolStatus.DeallocatedVMs, logger);
@@ -144,10 +145,9 @@ namespace DeployVMFunction
                             logger.LogInformation($"VM {vm.Data.Name} is already running.");
                         }
                         
-                        // Generate and configure the user account
+                        // Generate and configure the user accounts
                         string password = Program.GenerateSecurePassword(16);
-                        bool configSuccess = await Program.ConfigureVMUserAccountAsync(vm, password, logger);
-                        
+                        bool configSuccess = await Program.ConfigureMultiUserAccountsAsync(vm, password, logger);
                         if (configSuccess)
                         {
                             // Store the password for future use
@@ -159,12 +159,48 @@ namespace DeployVMFunction
                             logger.LogWarning($"Failed to configure user account for VM {vm.Data.Name}");
                         }
                         
-                        // If the VM wasn't running before, deallocate it
+                        // If the VM wasn't running before, hibernate it instead of deallocating
                         if (!wasRunning)
                         {
-                            logger.LogInformation($"Deallocating VM {vm.Data.Name}...");
-                            await vm.DeallocateAsync(Azure.WaitUntil.Completed);
-                            logger.LogInformation($"VM {vm.Data.Name} deallocated and returned to pool");
+                            logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
+                            try
+                            {
+                                // Method 1: Try to use the built-in hibernate parameter on PowerOff
+                                var parameters = new Dictionary<string, string>();
+                                parameters.Add("skipShutdown", "true");
+                                parameters.Add("hibernate", "true");
+                                
+                                    try {
+                                    // Try to hibernate using the PowerOff method with hibernate parameter
+                                    await vm.PowerOffAsync(WaitUntil.Completed, skipShutdown: true);
+                                    logger.LogInformation($"VM {vm.Data.Name} hibernated and returned to pool");
+                                    return; // Exit the method since we're done
+                                }
+                                catch (Exception innerEx) {
+                                }
+                                
+                                // Method 2: Use PowerState runCommand as fallback
+                                string hibernateScript = @"
+                                    $state = Stop-Computer -Force -PassThru -Hibernate
+                                    Write-Output ""Hibernate command returned: $state""
+                                ";
+                                
+                                var runCommandInput = new RunCommandInput("RunPowerShellScript");
+                                runCommandInput.Script.Add(hibernateScript);
+                                
+                                await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                                logger.LogInformation($"Successfully sent hibernation command to VM {vm.Data.Name}");
+                                
+                                // Wait a bit for the hibernation to take effect
+                                await Task.Delay(TimeSpan.FromSeconds(10));
+                                logger.LogInformation($"VM {vm.Data.Name} hibernated and returned to pool");
+                            }
+                            catch (Exception hibEx)
+                            {
+                                logger.LogWarning(hibEx, $"Failed to hibernate VM {vm.Data.Name}. Falling back to deallocation.");
+                                await vm.DeallocateAsync(Azure.WaitUntil.Completed);
+                                logger.LogInformation($"VM {vm.Data.Name} deallocated (fallback) and returned to pool");
+                            }
                         }
                     }
                     catch (Exception ex)

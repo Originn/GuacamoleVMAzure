@@ -116,7 +116,6 @@ namespace DeployVMFunction
                     await creationErrorResponse.WriteAsJsonAsync(new { error = "Failed to provision a virtual machine.", details = ex.Message });
                     return creationErrorResponse;
                 }
-
                 VirtualMachineResource vm = await vmAllocationTask;
                 string vmName = vm.Data?.Name ?? "UnknownVM";
                 log.LogInformation($"Allocated VM {vmName} from pool");
@@ -150,6 +149,33 @@ namespace DeployVMFunction
                 }
                 log.LogInformation($"VM Private IP for {vmName}: {targetVmPrivateIp}");
 
+                log.LogInformation($"VM {vmName} has been allocated from the pool. Resuming from hibernation...");
+                
+                // Check if VM is in hibernated state and resume it
+                bool isHibernated = false;
+                try {
+                    var instanceView = await vm.InstanceViewAsync();
+                    var statuses = instanceView?.Value?.Statuses;
+                    if (statuses != null) {
+                        var powerState = statuses.FirstOrDefault(s => s.Code != null && s.Code.StartsWith("PowerState/"))?.Code;
+                        isHibernated = powerState == "PowerState/stopped" || powerState == "PowerState/deallocated";
+                    }
+                } catch (Exception ex) {
+                    log.LogWarning(ex, $"Error checking hibernation state of VM {vmName}. Will attempt to start it anyway.");
+                }
+
+                if (isHibernated) {
+                    log.LogInformation($"VM {vmName} appears to be hibernated. Starting it up...");
+                    try {
+                        await vm.PowerOnAsync(WaitUntil.Completed); // This will resume from hibernation if the VM was hibernated
+                        log.LogInformation($"Successfully started VM {vmName} from hibernation.");
+                    } catch (Exception ex) {
+                        log.LogWarning(ex, $"Error resuming VM {vmName} from hibernation. Will continue and hope it starts normally.");
+                    }
+                } else {
+                    log.LogInformation($"VM {vmName} is not in a hibernated state. It should be running already.");
+                }
+                
                 log.LogInformation($"Waiting for VM {vmName} to complete boot process and initialize RDP service...");
                 int attempts = 0, maxAttempts = 40;
                 bool isRdpReady = false;
@@ -198,19 +224,17 @@ namespace DeployVMFunction
                     }
                 }
 
-                if (!isRdpReady) { log.LogWarning($"VM {vmName} RDP service did not become responsive. Proceeding anyway..."); }
-
-                // Get the VM password from storage
+                // Get the VM password from storage - this should ALWAYS be done for pool VMs
                 randomPassword = Program.GetVMPassword(vmName, log);
                 
-                // If no password was found in storage, generate one and configure the user account
+                // If no password was found in storage, generate one and configure the user accounts
                 if (string.IsNullOrEmpty(randomPassword))
                 {
                     log.LogWarning($"No stored password found for VM {vmName}. Generating and configuring a new password.");
                     randomPassword = Program.GenerateSecurePassword(16);
                     
-                    // Configure the SolidCAMOperator account with the new password
-                    bool configSuccess = await Program.ConfigureVMUserAccountAsync(vm, randomPassword, log);
+                    // Configure the multiple SolidCAMOperator accounts with the new password
+                    bool configSuccess = await Program.ConfigureMultiUserAccountsAsync(vm, randomPassword, log);
                     
                     if (configSuccess)
                     {
@@ -220,14 +244,13 @@ namespace DeployVMFunction
                     }
                     else
                     {
-                        log.LogError($"Failed to configure user account for VM {vmName}. Deployment might fail.");
+                        log.LogError($"Failed to configure user accounts for VM {vmName}. Deployment might fail.");
                     }
                 }
                 else
                 {
                     log.LogInformation($"Retrieved existing password for VM {vmName} from storage");
                 }
-
                 // --- Prepare Guacamole token authentication ---
                 log.LogInformation($"Preparing Guacamole connection for VM {vmName} ({targetVmPrivateIp})...");
                 string tokenUrl = $"{guacamoleApiBaseUrl.TrimEnd('/')}/api/tokens";
@@ -270,8 +293,12 @@ namespace DeployVMFunction
                     return authErrorResponse;
                 }
 
-                string? guacamoleConnectionId = await CreateGuacamoleConnection(vmName, targetVmPrivateIp, "SolidCAMOperator", 
-                                                                           randomPassword, guacamoleApiBaseUrl, authToken, dataSource, log);
+                // Determine which user account to assign based on round-robin strategy
+                string targetUsername = GetNextAvailableUserAccount(log);
+                log.LogInformation($"Assigning user to {targetUsername} for VM {vmName}");
+                
+                string? guacamoleConnectionId = await CreateGuacamoleConnection(vmName, targetVmPrivateIp, targetUsername, 
+                                                                             randomPassword, guacamoleApiBaseUrl, authToken, dataSource, log);
 
                 if (string.IsNullOrEmpty(guacamoleConnectionId))
                 {
@@ -284,20 +311,28 @@ namespace DeployVMFunction
                 }
                 log.LogInformation($"Successfully registered Guacamole connection for {vmName}. Encoded ID: {guacamoleConnectionId}");
 
-                // Only schedule deallocation for newly created VMs, not VMs from the warm pool
+                // Only schedule hibernation for newly created VMs, not VMs from the warm pool
                 if (!vmName.StartsWith("SolidCAM-VM-Pool-"))
                 {
-                    // Schedule the VM for deallocation after 60 seconds
+                    // Schedule the VM for hibernation after 60 seconds
                     _ = Task.Run(async () => {
                         try {
-                            log.LogInformation($"VM {vmName} will be deallocated in 60 seconds...");
+                            log.LogInformation($"VM {vmName} will be hibernated in 60 seconds...");
                             await Task.Delay(TimeSpan.FromSeconds(60));
-                            log.LogInformation($"Starting deallocation of VM {vmName}...");
-                            await vm.DeallocateAsync(WaitUntil.Completed);
-                            log.LogInformation($"Successfully deallocated VM {vmName}");
+                            log.LogInformation($"Starting hibernation of VM {vmName}...");
+                            // Use PowerOff with hibernate=true to hibernate the VM
+                            await vm.PowerOffAsync(WaitUntil.Completed, skipShutdown: true);
+                            log.LogInformation($"Successfully hibernated VM {vmName}");
                         }
                         catch (Exception ex) {
-                            log.LogError(ex, $"Failed to deallocate VM {vmName}: {ex.Message}");
+                            log.LogError(ex, $"Failed to hibernate VM {vmName}: {ex.Message}");
+                            log.LogInformation($"Attempting to deallocate VM {vmName} as fallback...");
+                            try {
+                                await vm.DeallocateAsync(WaitUntil.Completed);
+                                log.LogInformation($"Successfully deallocated VM {vmName} as fallback");
+                            } catch (Exception deallocEx) {
+                                log.LogError(deallocEx, $"Failed to deallocate VM {vmName} as fallback: {deallocEx.Message}");
+                            }
                         }
                     });
                 }
@@ -312,7 +347,7 @@ namespace DeployVMFunction
                     guacamoleConnectionId = guacamoleConnectionId,
                     guacamoleAuthToken = authToken,
                     resourceGroup = vm.Id?.ResourceGroupName ?? "Unknown",
-                    vmUsername = "SolidCAMOperator",
+                    vmUsername = targetUsername,
                     vmPassword = randomPassword,
                     vmSize = vm.Data?.HardwareProfile?.VmSize?.ToString() ?? "Unknown",
                     provisioningDurationEstimate = $"{attempts * 6} seconds"
@@ -321,7 +356,6 @@ namespace DeployVMFunction
             }
             catch (Exception ex)
             {
-                log.LogError(ex, $"Unhandled error during VM deployment function execution: {ex.ToString()}");
                 var responseCatch = req.CreateResponse(HttpStatusCode.InternalServerError);
                 responseCatch.Headers.Add("Access-Control-Allow-Origin", allowedOrigin);
                 responseCatch.Headers.Add("Access-Control-Allow-Credentials", "true");
@@ -389,6 +423,23 @@ namespace DeployVMFunction
             } catch (Exception ex) { 
                 log.LogError(ex, $"Exception during Guac create connection API call: {ex.ToString()}"); 
                 return null; 
+            }
+        }
+
+        // Assign users to different operator accounts in a round-robin fashion
+        // Assign users to different operator accounts in a round-robin fashion
+        private static int currentOperatorIndex = 0;
+        private static readonly object operatorIndexLock = new object();
+
+        private static string GetNextAvailableUserAccount(ILogger log)
+        {
+            lock (operatorIndexLock)
+            {
+                // Increment and wrap around using only accounts 1-3
+                currentOperatorIndex = (currentOperatorIndex % 3) + 1;
+                string username = $"SolidCAMOperator{currentOperatorIndex}";
+                log.LogInformation($"Allocated user account {username} (index: {currentOperatorIndex})");
+                return username;
             }
         }
     }

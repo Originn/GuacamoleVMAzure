@@ -15,9 +15,9 @@
         
         "VNET_NAME": "SolidCAM-Golden-Image-vnet",
         "SUBNET_NAME": "SolidCAM-VM-Subnet",
-        "GALLERY_IMAGE_ID": "/subscriptions/05329ba1-6d97-4b22-808c-9f448c4e9a11/resourceGroups/SolidCAM-Golden-Image_group/providers/Microsoft.Compute/galleries/solidcam_image_gallery/images/solidcam-golden-image/versions/1.0.2",
+        "GALLERY_IMAGE_ID": "/subscriptions/05329ba1-6d97-4b22-808c-9f448c4e9a11/resourceGroups/SolidCAM-Golden-Image_group/providers/Microsoft.Compute/galleries/solidcam_image_gallery/images/SolidCAM-Multisession-Hibernate/versions/0.0.6",
         
-        "MIN_POOL_SIZE": "2",
-        "VM_SIZE": "Standard_D2s_v3"
+        "MIN_POOL_SIZE": "1",
+        "VM_SIZE": "Standard_B2as_v2"
     }
 }

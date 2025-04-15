@@ -54,47 +54,19 @@ namespace DeployVMFunction
             _vnetName = Environment.GetEnvironmentVariable("VNET_NAME") ?? "SolidCAM-Golden-Image-vnet";
             _subnetName = Environment.GetEnvironmentVariable("SUBNET_NAME") ?? "default";
             _galleryImageId = Environment.GetEnvironmentVariable("GALLERY_IMAGE_ID") ??
-                "/subscriptions/05329ba1-6d97-4b22-808c-9f448c4e9a11/resourceGroups/SolidCAM-Golden-Image_group/providers/Microsoft.Compute/galleries/solidcam_image_gallery/images/solidcam-golden-image/versions/1.0.2";
+                "/subscriptions/05329ba1-6d97-4b22-808c-9f448c4e9a11/resourceGroups/SolidCAM-Golden-Image_group/providers/Microsoft.Compute/galleries/solidcam_image_gallery/images/SolidCAM-Multisession-Hibernate/versions/0.0.6";
             _guacamoleServerPrivateIp = Environment.GetEnvironmentVariable("GUACAMOLE_SERVER_PRIVATE_IP") ?? ""; // Required
             
             // Set location based on environment variable or default to NorthEurope
             var locationStr = Environment.GetEnvironmentVariable("AZURE_LOCATION")?.ToLowerInvariant();
-            _location = locationStr switch
-            {
-                "westeurope" => AzureLocation.WestEurope,
-                "eastus" => AzureLocation.EastUS,
-                "eastus2" => AzureLocation.EastUS2,
-                "westus" => AzureLocation.WestUS,
-                "westus2" => AzureLocation.WestUS2,
-                "southcentralus" => AzureLocation.SouthCentralUS,
-                "northcentralus" => AzureLocation.NorthCentralUS,
-                "centralus" => AzureLocation.CentralUS,
-                "francecentral" => AzureLocation.FranceCentral,
-                "uksouth" => AzureLocation.UKSouth,
-                "ukwest" => AzureLocation.UKWest,
-                "eastasia" => AzureLocation.EastAsia,
-                "southeastasia" => AzureLocation.SoutheastAsia,
-                "japaneast" => AzureLocation.JapanEast,
-                "japanwest" => AzureLocation.JapanWest,
-                "australiaeast" => AzureLocation.AustraliaEast,
-                "australiasoutheast" => AzureLocation.AustraliaSoutheast,
-                "southindia" => AzureLocation.SouthIndia,
-                "centralindia" => AzureLocation.CentralIndia,
-                "westindia" => AzureLocation.WestIndia,
-                "canadacentral" => AzureLocation.CanadaCentral,
-                "canadaeast" => AzureLocation.CanadaEast,
-                "germanywestcentral" => AzureLocation.GermanyWestCentral,
-                _ => AzureLocation.NorthEurope,
-            };
+            _location = AzureLocation.NorthEurope;  // Always use North Europe
             
             // Define location fallback options with westeurope and israelcentral only
             _locationFallbackOptions = new List<AzureLocation>
             {
-                _location,                   // Primary location first (from AZURE_LOCATION env var)
-                AzureLocation.WestEurope,    // West Europe as first fallback
-                AzureLocation.IsraelCentral  // Israel Central as second fallback
+                AzureLocation.NorthEurope    // Only use North Europe, no fallbacks
             };
-            
+                        
             // Remove duplicates and ensure current location is first
             _locationFallbackOptions = _locationFallbackOptions.Distinct().ToList();
             if (_locationFallbackOptions.First() != _location)
@@ -103,8 +75,8 @@ namespace DeployVMFunction
                 _locationFallbackOptions.Insert(0, _location);
             }
 
-            // Read VM_SIZE from environment variable, defaulting to Standard_D2s_v3 if not set
-            var vmSizeString = Environment.GetEnvironmentVariable("VM_SIZE") ?? "Standard_D2s_v3";
+            // Read VM_SIZE from environment variable, defaulting to Standard B2as v2 if not set
+            var vmSizeString = Environment.GetEnvironmentVariable("VM_SIZE") ?? "Standard_B2as_v2";
             _vmSize = new VirtualMachineSizeType(vmSizeString);
 
             // Only use the specified VM size without fallbacks
@@ -256,14 +228,21 @@ namespace DeployVMFunction
                             {
                                 result.RunningVMs.Add(vm);
                             }
-                            // Treat starting/stopping/deallocating as transitioning
-                            else if (powerState == "PowerState/starting" || powerState == "PowerState/stopping" || powerState == "PowerState/deallocating")
+                            // Add this condition to recognize stopped VMs with hibernation too
+                            else if (powerState == "PowerState/stopped")
                             {
-                                result.TransitioningVMs.Add(vm);
-                            }
-                            else {
-                                _logger.LogWarning($"Pool VM {vm.Data.Name} found with unknown or unexpected power state: {powerState ?? "null"}. Treating as transitioning.");
-                                result.TransitioningVMs.Add(vm); // Add to transitioning if state is unclear
+                                // Check if it has a hibernation state too
+                                var hibernateState = statuses?.FirstOrDefault(s => s.Code != null && s.Code.StartsWith("HibernationState/"))?.Code;
+                                if (hibernateState == "HibernationState/Hibernated")
+                                {
+                                    _logger.LogInformation($"VM {vm.Data.Name} is in stopped state with hibernation. Adding to available pool.");
+                                    result.DeallocatedVMs.Add(vm);
+                                }
+                                else
+                                {
+                                    _logger.LogWarning($"VM {vm.Data.Name} is in stopped state without hibernation. Treating as transitioning.");
+                                    result.TransitioningVMs.Add(vm);
+                                }
                             }
                         } else {
                             _logger.LogWarning($"Could not retrieve instance view statuses for pool VM {vm.Data.Name}. Treating as transitioning.");
@@ -454,7 +433,7 @@ namespace DeployVMFunction
             }
         }
 
-        /// <summary>
+         /// <summary>
         /// Creates a new VM (NSG, NIC, VM) with configured password and then deallocates it.
         /// Intended for adding VMs to the pool.
         /// </summary>
@@ -535,6 +514,11 @@ namespace DeployVMFunction
                             var vmData = new VirtualMachineData(locationOption) // Use current location option
                             {
                                 HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption }, // Use current size option
+                                // Add this line - Note the correct class name
+                                AdditionalCapabilities = new Azure.ResourceManager.Compute.Models.AdditionalCapabilities 
+                                { 
+                                    HibernationEnabled = true 
+                                },
                                 NetworkProfile = new VirtualMachineNetworkProfile() {
                                     NetworkInterfaces = { new VirtualMachineNetworkInterfaceReference() { Id = nic.Id, Primary = true } }
                                 },
@@ -550,8 +534,13 @@ namespace DeployVMFunction
                                         }
                                     }
                                 },
-                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch } // Assuming Trusted Launch is desired/compatible
-                                // OSProfile might be needed if the image doesn't have embedded creds/setup (unlikely for gallery images)
+                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch }, // Assuming Trusted Launch is desired/compatible
+                                OSProfile = new VirtualMachineOSProfile() // Required even with gallery images in this version of the SDK
+                                { 
+                                    ComputerName = vmName.Length > 15 ? vmName.Substring(0, 15) : vmName, // Windows VM names can't exceed 15 chars
+                                    AdminUsername = "localadmin", // Will be overridden by the gallery image, but required by the API
+                                    AdminPassword = Program.GenerateSecurePassword(16) // Will be overridden by the gallery image, but required by the API
+                                }
                             };
                             _logger.LogInformation($"Creating pool VM: {vmName} using image {_galleryImageId}");
                             var vmCollection = _resourceGroup.GetVirtualMachines();
@@ -559,35 +548,35 @@ namespace DeployVMFunction
                             VirtualMachineResource vm = vmCreateOp.Value;
                             _logger.LogInformation($"VM creation completed for pool VM: {vm.Data.Name}");
 
-                            // Configure the user account while the VM is running (OPTIMIZATION)
-                            _logger.LogInformation($"Configuring user account for VM {vm.Data.Name} while running...");
+                            // Configure the user accounts while the VM is running (OPTIMIZATION)
+                            _logger.LogInformation($"Configuring user accounts for VM {vm.Data.Name} while running...");
                             
                             // Wait for a short time to ensure VM is fully running and services are up
                             _logger.LogInformation($"Allowing brief initialization time for VM {vm.Data.Name}...");
                             await Task.Delay(TimeSpan.FromSeconds(30));
                             
-                            // Generate and configure the password
+                            // Generate and configure the passwords for multiple user accounts
                             string password = Program.GenerateSecurePassword(16);
-                            bool configSuccess = await Program.ConfigureVMUserAccountAsync(vm, password, _logger);
+                            bool configSuccess = await Program.ConfigureMultiUserAccountsAsync(vm, password, _logger);
                             
                             if (configSuccess)
                             {
                                 // Store the password for future use
                                 await Program.StoreVMPasswordAsync(vm.Data.Name, password, _logger);
-                                _logger.LogInformation($"Successfully configured user account for VM {vm.Data.Name}");
+                                _logger.LogInformation($"Successfully configured user accounts for VM {vm.Data.Name}");
                             }
                             else
                             {
-                                _logger.LogWarning($"Failed to configure user account for VM {vm.Data.Name}. VM will still be added to pool.");
+                                _logger.LogWarning($"Failed to configure user accounts for VM {vm.Data.Name}. VM will still be added to pool.");
                             }
 
-                            _logger.LogInformation($"Running persistent optimization before deallocating pool VM: {vmName}");
+                            _logger.LogInformation($"Running persistent optimization before hibernating pool VM: {vmName}");
                             await OptimizeVMForFasterStartupAsync(vm);
 
-                            // Now deallocate the VM (only once)
-                            _logger.LogInformation($"Deallocating pool VM: {vmName}");
-                            await vm.DeallocateAsync(Azure.WaitUntil.Completed);
-                            _logger.LogInformation($"Pool VM deallocated: {vmName} and ready for use");
+                            // Now hibernate the VM instead of deallocating
+                            _logger.LogInformation($"Hibernating pool VM: {vmName}");
+                            await HibernateVMAsync(vm);
+                            _logger.LogInformation($"Pool VM hibernated: {vmName} and ready for use");
 
                             // Update the default VM size and location if a fallback worked
                             if (!vmSizeOption.ToString().Equals(_vmSize.ToString(), StringComparison.OrdinalIgnoreCase))
@@ -602,7 +591,7 @@ namespace DeployVMFunction
                                 _location = locationOption;
                             }
 
-                            return vm; // Return the deallocated VM resource
+                            return vm; // Return the hibernated VM resource
                         }
                         catch (RequestFailedException ex) when (ex.Status == 409 && ex.Message.Contains("quota"))
                         {
@@ -765,6 +754,11 @@ namespace DeployVMFunction
                             var vmData = new VirtualMachineData(locationOption) // Use current location option
                             {
                                 HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption }, // Use current size option
+                                // Add this line - Note the correct class name
+                                AdditionalCapabilities = new Azure.ResourceManager.Compute.Models.AdditionalCapabilities 
+                                { 
+                                    HibernationEnabled = true 
+                                },
                                 NetworkProfile = new VirtualMachineNetworkProfile() {
                                     NetworkInterfaces = { new VirtualMachineNetworkInterfaceReference() { Id = nic.Id, Primary = true } }
                                 },
@@ -780,8 +774,13 @@ namespace DeployVMFunction
                                         }
                                     }
                                 },
-                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch } // Assuming Trusted Launch is desired/compatible
-                                // OSProfile might be needed if the image doesn't have embedded creds/setup (unlikely for gallery images)
+                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch }, // Assuming Trusted Launch is desired/compatible
+                                OSProfile = new VirtualMachineOSProfile() // Required even with gallery images in this version of the SDK
+                                { 
+                                    ComputerName = vmName.Length > 15 ? vmName.Substring(0, 15) : vmName, // Windows VM names can't exceed 15 chars
+                                    AdminUsername = "localadmin", // Will be overridden by the gallery image, but required by the API
+                                    AdminPassword = Program.GenerateSecurePassword(16) // Will be overridden by the gallery image, but required by the API
+                                }
                             };
                             _logger.LogInformation($"Creating VM: {vmName} using image {_galleryImageId}");
                             var vmCollection = _resourceGroup.GetVirtualMachines();
@@ -965,10 +964,34 @@ namespace DeployVMFunction
             else
             {
                 // Create new VM if pool is empty (also outside lock)
-                return await CreateAndReturnRunningVMAsync("user");
+                // Create new VM if pool is empty (also outside lock)
+                _logger.LogInformation("Pool is empty, creating a new VM directly");
+            return await CreateAndReturnRunningVMAsync("user");
             }
         }
-    }
+        /// <summary>
+        /// Hibernates a VM instead of deallocating it
+        /// </summary>
+            private async Task HibernateVMAsync(VirtualMachineResource vm)
+            {
+                try
+                {
+                    _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
+                    
+                    // Use deallocate with hibernate=true instead of PowerOff
+                    await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
+                    _logger.LogInformation($"Successfully hibernated VM {vm.Data.Name}");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, $"Failed to hibernate VM {vm.Data.Name}. Attempting normal deallocate instead.");
+                    // Fallback to normal deallocation if hibernation fails
+                    await vm.DeallocateAsync(WaitUntil.Completed);
+                    _logger.LogInformation($"VM {vm.Data.Name} deallocated as fallback");
+                }
+            }
+        }
+    
     
 
     /// <summary>

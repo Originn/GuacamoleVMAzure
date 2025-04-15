@@ -12,7 +12,6 @@ using Azure;
 using Azure.Identity;
 using Azure.ResourceManager;
 using Azure.ResourceManager.Compute;
-using Azure.ResourceManager.Compute.Models;
 using Azure.ResourceManager.Network;
 using Azure.ResourceManager.Network.Models;
 using Azure.ResourceManager.Resources;
@@ -20,6 +19,7 @@ using Azure.Core;
 using Azure.Data.Tables;
 using DeployVMFunction;
 using Microsoft.Extensions.Configuration;
+using Azure.ResourceManager.Compute.Models;
 
 namespace DeployVMFunction
 {
@@ -184,10 +184,9 @@ namespace DeployVMFunction
                         var vm = await poolManager.CreateAndReturnRunningVMAsync("pool");
                         logger.LogInformation($"Successfully created VM: {vm.Data.Name}");
                         
-                        // Generate and store password for the VM
-                        var password = GenerateSecurePassword(16);
-                        bool configSuccess = await ConfigureVMUserAccountAsync(vm, password, logger);
-                        
+                            // Generate and store password for the VM
+                            var password = GenerateSecurePassword(16);
+                            bool configSuccess = await ConfigureMultiUserAccountsAsync(vm, password, logger);
                         if (configSuccess)
                         {
                             // Store password in Table Storage and memory cache
@@ -244,7 +243,6 @@ namespace DeployVMFunction
             try
             {
                 logger.LogInformation($"Starting warm-up process for VM {vm.Data.Name}...");
-                
                 // Get the VM's private IP address for testing connectivity
                 string vmPrivateIp = await GetVMPrivateIPAsync(vm, logger);
                 if (string.IsNullOrEmpty(vmPrivateIp))
@@ -282,10 +280,19 @@ namespace DeployVMFunction
                     await Task.Delay(TimeSpan.FromSeconds(remainingWarmupTime));
                 }
                 
-                // Deallocate the VM
-                logger.LogInformation($"Warm-up complete for {vm.Data.Name}. Deallocating...");
-                await vm.DeallocateAsync(WaitUntil.Completed);
-                logger.LogInformation($"VM {vm.Data.Name} deallocated and returned to pool.");
+                // Hibernate the VM
+                logger.LogInformation($"Warm-up complete for {vm.Data.Name}. Hibernating...");
+                try
+                {
+                    await vm.PowerOffAsync(WaitUntil.Completed, skipShutdown: true);// skipShutdown: true, hibernate: true
+                    logger.LogInformation($"VM {vm.Data.Name} hibernated and returned to pool.");
+                }
+                catch (Exception hibEx)
+                {
+                    logger.LogWarning(hibEx, $"Failed to hibernate VM {vm.Data.Name}. Falling back to deallocation.");
+                    await vm.DeallocateAsync(WaitUntil.Completed);
+                    logger.LogInformation($"VM {vm.Data.Name} deallocated (fallback) and returned to pool.");
+                }
             }
             catch (Exception ex)
             {
@@ -306,7 +313,6 @@ namespace DeployVMFunction
                 throw;
             }
         }
-
         // Helper method to get VM's private IP address
         private static async Task<string> GetVMPrivateIPAsync(VirtualMachineResource vm, ILogger logger)
         {
@@ -542,6 +548,108 @@ Write-Output ""Done with initialization.""
             catch (Exception ex)
             {
                 logger.LogError(ex, $"Exception during account setup on VM {vm.Data.Name}");
+                return false;
+            }
+        }
+
+        // Configure multiple user accounts (SolidCAMOperator1, SolidCAMOperator2, etc.)
+        public static async Task<bool> ConfigureMultiUserAccountsAsync(VirtualMachineResource vm, string password, ILogger logger)
+        {
+            logger.LogInformation($"Configuring multiple SolidCAMOperator accounts on VM {vm.Data.Name}...");
+            
+            // Create PowerShell script to configure multiple user accounts
+            string psScript = @"
+    $p = ConvertTo-SecureString '" + password.Replace("'", "''") + @"' -AsPlainText -Force;
+    $success = $true;
+
+    # Image already has accounts 1-3, just update them with new password
+    for ($i = 1; $i -le 3; $i++) {
+        $u = ""SolidCAMOperator$i"";
+        try {
+            Write-Output ""Processing user $u..."";
+            $e = Get-LocalUser -Name $u -EA SilentlyContinue;
+            
+            if ($e) {
+                Write-Output ""Setting password for $u..."";
+                Set-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires $true;
+                Write-Output ""Enabling user $u..."";
+                Enable-LocalUser -Name $u;
+                Write-Output ""$u configuration complete."";
+            } else {
+                Write-Output ""User $u not found. Skipping as it should already exist in the image."";
+                $success = $false;
+            }
+        } catch {
+            $success = $false;
+            Write-Error ""ERR configuring $u: $($_.Exception.Message)"";
+        }
+    }
+
+    # Also configure legacy SolidCAMOperator account for compatibility if it exists
+    try {
+        $u = ""SolidCAMOperator"";
+        Write-Output ""Processing legacy user $u..."";
+        $e = Get-LocalUser -Name $u -EA SilentlyContinue;
+        
+        if ($e) {
+            Write-Output ""Setting password for $u..."";
+            Set-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires $true;
+            Write-Output ""Enabling user $u..."";
+            Enable-LocalUser -Name $u;
+            Write-Output ""$u configuration complete."";
+        } else {
+            Write-Output ""Legacy user $u not found. Skipping as it may not be in the image."";
+        }
+    } catch {
+        Write-Error ""ERR configuring legacy $u: $($_.Exception.Message)"";
+    }
+
+    if ($success) {
+        Write-Output ""SUCCESS: All users configured successfully."";
+    } else {
+        Write-Error ""ERR: One or more users failed to configure."";
+    }
+";
+            
+            var runCommandInput = new RunCommandInput("RunPowerShellScript");
+            runCommandInput.Script.Add(psScript);
+            
+            try
+            {
+                var commandStartTime = DateTime.UtcNow;
+                logger.LogInformation($"Executing multiple account setup script on VM {vm.Data.Name}...");
+                
+                var passwordResetOperation = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                var passwordResetResult = passwordResetOperation?.Value;
+                
+                if (passwordResetResult?.Value != null && passwordResetResult.Value.Any())
+                {
+                    bool errorFound = false;
+                    foreach (var status in passwordResetResult.Value)
+                    {
+                        if (status.Level?.ToString().Equals("Error", StringComparison.OrdinalIgnoreCase) == true ||
+                            status.Message?.Contains("ERR:") == true)
+                        {
+                            errorFound = true;
+                            logger.LogError($"Error in multi-account setup: {status.Message}");
+                        }
+                    }
+                    
+                    if (!errorFound && passwordResetResult.Value.Any(s => s.Message?.Contains("SUCCESS: All users configured") == true))
+                    {
+                        var commandEndTime = DateTime.UtcNow;
+                        var commandDuration = commandEndTime - commandStartTime;
+                        logger.LogInformation($"Successfully configured multiple SolidCAMOperator accounts on VM {vm.Data.Name} in {commandDuration.TotalSeconds:F2} seconds");
+                        return true;
+                    }
+                }
+                
+                logger.LogWarning($"Failed to configure all SolidCAMOperator accounts on VM {vm.Data.Name}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, $"Exception during multi-account setup on VM {vm.Data.Name}");
                 return false;
             }
         }
