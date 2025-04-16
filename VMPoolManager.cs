@@ -107,87 +107,46 @@ namespace DeployVMFunction
             _logger.LogInformation($"VMPoolManager initialized. Target RG: {_resourceGroup.Id}, Location: {_location}, Pool Size: {_minPoolSize}");
         }
 
-        private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
+private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
+{
+    _logger.LogInformation($"Running persistent optimization for VM {vm.Data.Name}…");
+
+    // 1) Find the script file (copied to output)
+    var scriptPath = Path.Combine(Environment.CurrentDirectory, "optimization.ps1");
+    if (!File.Exists(scriptPath))
+        throw new FileNotFoundException($"Cannot find {scriptPath}");
+
+    // 2) Read all lines
+    var scriptLines = File.ReadAllLines(scriptPath);
+
+    // 3) Build the RunCommand input
+    var runCommandInput = new RunCommandInput("RunPowerShellScript");
+    foreach (var line in scriptLines)
+    {
+        runCommandInput.Script.Add(line);
+    }
+
+    // 4) Execute it
+    try
+    {
+        var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+        _logger.LogInformation($"Persistent optimization completed for VM {vm.Data.Name}");
+        if (result?.Value?.Value != null)
         {
-            _logger.LogInformation($"Running persistent optimization for VM {vm.Data.Name}...");
-            
-string optimizationScript = @"
-# PERSISTENT OPTIMIZATION SCRIPT
-Write-Output ""Starting persistent VM optimizations...""
-
-# 1. Configure Windows boot settings for faster startup
-Write-Output ""Optimizing boot configuration...""
-bcdedit /set bootmenupolicy standard
-bcdedit /set {current} bootstatuspolicy ignoreallfailures
-bcdedit /timeout 3
-
-# 2. Configure services for faster RDP startup
-Write-Output ""Optimizing service configuration...""
-Set-Service -Name TermService -StartupType Automatic
-Set-Service -Name LanmanServer -StartupType Automatic
-Set-Service -Name SessionEnv -StartupType Automatic
-Set-Service -Name UmRdpService -StartupType Automatic
-Set-Service -Name TermService -Status Running
-
-# 3. Registry optimizations for RDP and startup
-Write-Output ""Applying registry optimizations...""
-reg add ""HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"" /v fDenyTSConnections /t REG_DWORD /d 0 /f
-reg add ""HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"" /v SecurityLayer /t REG_DWORD /d 1 /f
-reg add ""HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"" /v UserAuthentication /t REG_DWORD /d 0 /f
-reg add ""HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"" /v VisualFXSetting /t REG_DWORD /d 2 /f
-reg add ""HKCU\Control Panel\Desktop"" /v UserPreferencesMask /t REG_BINARY /d 9012078010000000 /f
-reg add ""HKCU\Control Panel\Desktop\WindowMetrics"" /v MinAnimate /t REG_SZ /d 0 /f
-reg add ""HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"" /v SystemResponsiveness /t REG_DWORD /d 0 /f
-
-# 4. Disable unnecessary startup items
-Write-Output ""Disabling unnecessary startup items...""
-Get-ScheduledTask | Where-Object { $_.State -eq ""Ready"" -and ($_.TaskPath -like ""*\Startup\*"" -or $_.TaskName -like ""*OneDrive*"" -or $_.TaskName -like ""*Skype*"") } | Disable-ScheduledTask -ErrorAction SilentlyContinue
-
-# 5. Run SolidCAM-specific optimization if needed
-$solidcamPath = ""C:\Program Files\SolidCAM""
-if (Test-Path $solidcamPath) {
-    Write-Output ""Optimizing SolidCAM configuration...""
-    if (Test-Path ""$solidcamPath\config"") {
-        Copy-Item ""$solidcamPath\config"" ""$solidcamPath\config.cached"" -Recurse -Force -ErrorAction SilentlyContinue
+            foreach (var outp in result.Value.Value)
+                if (outp.Message?.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0)
+                    _logger.LogWarning($"Optimization warning: {outp.Message}");
+        }
+    }
+    catch (Exception ex)
+    {
+        _logger.LogWarning(ex, $"Optimization encountered issues for VM {vm.Data.Name}, continuing deallocation.");
     }
 }
 
-# 6. Schedule a quick optimization task that runs at Windows startup 
-Write-Output ""Creating startup optimization task...""
-# Build the command we want to run at startup.
-$psCommand = '& {Start-Service TermService -Force; Start-Service UmRdpService -Force; ipconfig /flushdns}'
-# Construct the argument string.
-$argument = ""-NoProfile -WindowStyle Hidden -Command """"$psCommand"""" ""
-# Create the scheduled task action using the constructed argument.
-$action = New-ScheduledTaskAction -Execute ""Powershell.exe"" -Argument $argument
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-$principal = New-ScheduledTaskPrincipal -UserId ""SYSTEM"" -LogonType ServiceAccount -RunLevel Highest
-Register-ScheduledTask -TaskName ""SolidCAM-StartupOptimizer"" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
-
-Write-Output ""Persistent VM optimization completed.""
-";
 
 
-            var runCommandInput = new RunCommandInput("RunPowerShellScript");
-            runCommandInput.Script.Add(optimizationScript);
-            
-            try {
-                var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
-                _logger.LogInformation($"Persistent optimization completed for VM {vm.Data.Name}");
-                
-                if (result?.Value?.Value != null) {
-                    foreach (var output in result.Value.Value) {
-                        if (output.Message?.Contains("error", StringComparison.OrdinalIgnoreCase) == true) {
-                            _logger.LogWarning($"Optimization warning for VM {vm.Data.Name}: {output.Message}");
-                        }
-                    }
-                }
-            }
-            catch (Exception ex) {
-                _logger.LogWarning(ex, $"Persistent optimization encountered issues for VM {vm.Data.Name}, but continuing with deallocation");
-            }
-        }
+
 
         /// <summary>
         /// Get current status of the VM pool (VMs named SolidCAM-VM-Pool-*)
