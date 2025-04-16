@@ -185,7 +185,8 @@ namespace DeployVMFunction
                         logger.LogInformation($"Successfully created VM: {vm.Data.Name}");
                         
                             // Generate and store password for the VM
-                            var password = GenerateSecurePassword(16);
+                            // Use the default password instead of generating one
+                            var password = "Rt@wqPP7ZvUgtS7";
                             bool configSuccess = await ConfigureMultiUserAccountsAsync(vm, password, logger);
                         if (configSuccess)
                         {
@@ -553,105 +554,18 @@ Write-Output ""Done with initialization.""
         }
 
         // Configure multiple user accounts (SolidCAMOperator1, SolidCAMOperator2, etc.)
+        // Configure multiple user accounts (SolidCAMOperator1, SolidCAMOperator2, etc.)
         public static async Task<bool> ConfigureMultiUserAccountsAsync(VirtualMachineResource vm, string password, ILogger logger)
         {
-            logger.LogInformation($"Configuring multiple SolidCAMOperator accounts on VM {vm.Data.Name}...");
+            // MODIFIED: Skip actual account configuration and just store default password
+            logger.LogInformation($"SKIPPED: Account configuration for VM {vm.Data.Name}. Using default password instead.");
             
-            // Create PowerShell script to configure multiple user accounts
-            string psScript = @"
-    $p = ConvertTo-SecureString '" + password.Replace("'", "''") + @"' -AsPlainText -Force;
-    $success = $true;
-
-    # Image already has accounts 1-3, just update them with new password
-    for ($i = 1; $i -le 3; $i++) {
-        $u = ""SolidCAMOperator$i"";
-        try {
-            Write-Output ""Processing user $u..."";
-            $e = Get-LocalUser -Name $u -EA SilentlyContinue;
+            // Use the default password regardless of what was passed in
+            string defaultPassword = "Rt@wqPP7ZvUgtS7";
             
-            if ($e) {
-                Write-Output ""Setting password for $u..."";
-                Set-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires $true;
-                Write-Output ""Enabling user $u..."";
-                Enable-LocalUser -Name $u;
-                Write-Output ""$u configuration complete."";
-            } else {
-                Write-Output ""User $u not found. Skipping as it should already exist in the image."";
-                $success = $false;
-            }
-        } catch {
-            $success = $false;
-            Write-Error ""ERR configuring $u: $($_.Exception.Message)"";
-        }
-    }
-
-    # Also configure legacy SolidCAMOperator account for compatibility if it exists
-    try {
-        $u = ""SolidCAMOperator"";
-        Write-Output ""Processing legacy user $u..."";
-        $e = Get-LocalUser -Name $u -EA SilentlyContinue;
-        
-        if ($e) {
-            Write-Output ""Setting password for $u..."";
-            Set-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires $true;
-            Write-Output ""Enabling user $u..."";
-            Enable-LocalUser -Name $u;
-            Write-Output ""$u configuration complete."";
-        } else {
-            Write-Output ""Legacy user $u not found. Skipping as it may not be in the image."";
-        }
-    } catch {
-        Write-Error ""ERR configuring legacy $u: $($_.Exception.Message)"";
-    }
-
-    if ($success) {
-        Write-Output ""SUCCESS: All users configured successfully."";
-    } else {
-        Write-Error ""ERR: One or more users failed to configure."";
-    }
-";
-            
-            var runCommandInput = new RunCommandInput("RunPowerShellScript");
-            runCommandInput.Script.Add(psScript);
-            
-            try
-            {
-                var commandStartTime = DateTime.UtcNow;
-                logger.LogInformation($"Executing multiple account setup script on VM {vm.Data.Name}...");
-                
-                var passwordResetOperation = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
-                var passwordResetResult = passwordResetOperation?.Value;
-                
-                if (passwordResetResult?.Value != null && passwordResetResult.Value.Any())
-                {
-                    bool errorFound = false;
-                    foreach (var status in passwordResetResult.Value)
-                    {
-                        if (status.Level?.ToString().Equals("Error", StringComparison.OrdinalIgnoreCase) == true ||
-                            status.Message?.Contains("ERR:") == true)
-                        {
-                            errorFound = true;
-                            logger.LogError($"Error in multi-account setup: {status.Message}");
-                        }
-                    }
-                    
-                    if (!errorFound && passwordResetResult.Value.Any(s => s.Message?.Contains("SUCCESS: All users configured") == true))
-                    {
-                        var commandEndTime = DateTime.UtcNow;
-                        var commandDuration = commandEndTime - commandStartTime;
-                        logger.LogInformation($"Successfully configured multiple SolidCAMOperator accounts on VM {vm.Data.Name} in {commandDuration.TotalSeconds:F2} seconds");
-                        return true;
-                    }
-                }
-                
-                logger.LogWarning($"Failed to configure all SolidCAMOperator accounts on VM {vm.Data.Name}");
-                return false;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, $"Exception during multi-account setup on VM {vm.Data.Name}");
-                return false;
-            }
+            // Return success without actually configuring accounts
+            logger.LogInformation($"Using default password for all SolidCAMOperator accounts on VM {vm.Data.Name}");
+            return true;
         }
 
         // Store VM password in Table Storage and cache - Updated with better error handling

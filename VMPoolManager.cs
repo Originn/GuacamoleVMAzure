@@ -111,68 +111,63 @@ namespace DeployVMFunction
         {
             _logger.LogInformation($"Running persistent optimization for VM {vm.Data.Name}...");
             
-            string optimizationScript = @"
-        # PERSISTENT OPTIMIZATION SCRIPT
-        # These changes will survive VM deallocation
+string optimizationScript = @"
+# PERSISTENT OPTIMIZATION SCRIPT
+Write-Output ""Starting persistent VM optimizations...""
 
-        Write-Output ""Starting persistent VM optimizations...""
+# 1. Configure Windows boot settings for faster startup
+Write-Output ""Optimizing boot configuration...""
+bcdedit /set bootmenupolicy standard
+bcdedit /set {current} bootstatuspolicy ignoreallfailures
+bcdedit /timeout 3
 
-        # 1. Configure Windows boot settings for faster startup
-        Write-Output ""Optimizing boot configuration...""
-        bcdedit /set bootmenupolicy standard
-        bcdedit /set {current} bootstatuspolicy ignoreallfailures
-        bcdedit /timeout 3
+# 2. Configure services for faster RDP startup
+Write-Output ""Optimizing service configuration...""
+Set-Service -Name TermService -StartupType Automatic
+Set-Service -Name LanmanServer -StartupType Automatic
+Set-Service -Name SessionEnv -StartupType Automatic
+Set-Service -Name UmRdpService -StartupType Automatic
+Set-Service -Name TermService -Status Running
 
-        # 2. Configure services for faster RDP startup
-        Write-Output ""Optimizing service configuration...""
-        Set-Service -Name TermService -StartupType Automatic
-        Set-Service -Name LanmanServer -StartupType Automatic
-        Set-Service -Name SessionEnv -StartupType Automatic
-        Set-Service -Name UmRdpService -StartupType Automatic
-        Set-Service -Name TermService -Status Running
+# 3. Registry optimizations for RDP and startup
+Write-Output ""Applying registry optimizations...""
+reg add ""HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"" /v fDenyTSConnections /t REG_DWORD /d 0 /f
+reg add ""HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"" /v SecurityLayer /t REG_DWORD /d 1 /f
+reg add ""HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"" /v UserAuthentication /t REG_DWORD /d 0 /f
+reg add ""HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"" /v VisualFXSetting /t REG_DWORD /d 2 /f
+reg add ""HKCU\Control Panel\Desktop"" /v UserPreferencesMask /t REG_BINARY /d 9012078010000000 /f
+reg add ""HKCU\Control Panel\Desktop\WindowMetrics"" /v MinAnimate /t REG_SZ /d 0 /f
+reg add ""HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"" /v SystemResponsiveness /t REG_DWORD /d 0 /f
 
-        # 3. Registry optimizations for RDP and startup
-        Write-Output ""Applying registry optimizations...""
-        # Enable RDP connection optimization
-        reg add ""HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"" /v fDenyTSConnections /t REG_DWORD /d 0 /f
-        reg add ""HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"" /v SecurityLayer /t REG_DWORD /d 1 /f
-        reg add ""HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"" /v UserAuthentication /t REG_DWORD /d 0 /f
+# 4. Disable unnecessary startup items
+Write-Output ""Disabling unnecessary startup items...""
+Get-ScheduledTask | Where-Object { $_.State -eq ""Ready"" -and ($_.TaskPath -like ""*\Startup\*"" -or $_.TaskName -like ""*OneDrive*"" -or $_.TaskName -like ""*Skype*"") } | Disable-ScheduledTask -ErrorAction SilentlyContinue
 
-        # Disable unnecessary visual effects
-        reg add ""HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"" /v VisualFXSetting /t REG_DWORD /d 2 /f
-        reg add ""HKCU\Control Panel\Desktop"" /v UserPreferencesMask /t REG_BINARY /d 9012078010000000 /f
-        reg add ""HKCU\Control Panel\Desktop\WindowMetrics"" /v MinAnimate /t REG_SZ /d 0 /f
+# 5. Run SolidCAM-specific optimization if needed
+$solidcamPath = ""C:\Program Files\SolidCAM""
+if (Test-Path $solidcamPath) {
+    Write-Output ""Optimizing SolidCAM configuration...""
+    if (Test-Path ""$solidcamPath\config"") {
+        Copy-Item ""$solidcamPath\config"" ""$solidcamPath\config.cached"" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
-        # Optimize system responsiveness
-        reg add ""HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"" /v SystemResponsiveness /t REG_DWORD /d 0 /f
+# 6. Schedule a quick optimization task that runs at Windows startup 
+Write-Output ""Creating startup optimization task...""
+# Build the command we want to run at startup.
+$psCommand = '& {Start-Service TermService -Force; Start-Service UmRdpService -Force; ipconfig /flushdns}'
+# Construct the argument string.
+$argument = ""-NoProfile -WindowStyle Hidden -Command """"$psCommand"""" ""
+# Create the scheduled task action using the constructed argument.
+$action = New-ScheduledTaskAction -Execute ""Powershell.exe"" -Argument $argument
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$principal = New-ScheduledTaskPrincipal -UserId ""SYSTEM"" -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName ""SolidCAM-StartupOptimizer"" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
 
-        # 4. Disable unnecessary startup items
-        Write-Output ""Disabling unnecessary startup items...""
-        Get-ScheduledTask | Where-Object {
-            $_.State -eq ""Ready"" -and 
-            ($_.TaskPath -like ""*\Startup\*"" -or $_.TaskName -like ""*OneDrive*"" -or $_.TaskName -like ""*Skype*"")
-        } | Disable-ScheduledTask -ErrorAction SilentlyContinue
+Write-Output ""Persistent VM optimization completed.""
+";
 
-        # 5. Run SolidCAM-specific optimization if needed
-        $solidcamPath = ""C:\Program Files\SolidCAM""
-        if (Test-Path $solidcamPath) {
-            Write-Output ""Optimizing SolidCAM configuration...""
-            # Create pre-cached config if needed
-            if (Test-Path ""$solidcamPath\config"") {
-                Copy-Item ""$solidcamPath\config"" ""$solidcamPath\config.cached"" -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-
-        # 6. Schedule a quick optimization task that runs at Windows startup 
-        Write-Output ""Creating startup optimization task...""
-        $action = New-ScheduledTaskAction -Execute 'Powershell.exe' -Argument '-NoProfile -WindowStyle Hidden -Command ""& {ipconfig /flushdns; Get-Service TermService | Restart-Service -Force}""'
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName ""SolidCAM-StartupOptimizer"" -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
-
-        Write-Output ""Persistent VM optimization completed.""
-        ";
 
             var runCommandInput = new RunCommandInput("RunPowerShellScript");
             runCommandInput.Script.Add(optimizationScript);
@@ -555,21 +550,18 @@ namespace DeployVMFunction
                             _logger.LogInformation($"Allowing brief initialization time for VM {vm.Data.Name}...");
                             await Task.Delay(TimeSpan.FromSeconds(30));
                             
-                            // Generate and configure the passwords for multiple user accounts
-                            string password = Program.GenerateSecurePassword(16);
+                            // Always use the default password instead of generating a random one
+                            string password = "Rt@wqPP7ZvUgtS7"; // Default password
                             bool configSuccess = await Program.ConfigureMultiUserAccountsAsync(vm, password, _logger);
                             
                             if (configSuccess)
                             {
-                                // Store the password for future use
-                                await Program.StoreVMPasswordAsync(vm.Data.Name, password, _logger);
-                                _logger.LogInformation($"Successfully configured user accounts for VM {vm.Data.Name}");
+                                _logger.LogInformation($"Successfully configured user accounts with default password for VM {vm.Data.Name}");
                             }
                             else
                             {
                                 _logger.LogWarning($"Failed to configure user accounts for VM {vm.Data.Name}. VM will still be added to pool.");
                             }
-
                             _logger.LogInformation($"Running persistent optimization before hibernating pool VM: {vmName}");
                             await OptimizeVMForFasterStartupAsync(vm);
 
@@ -861,136 +853,58 @@ namespace DeployVMFunction
         }
 
         /// <summary>
-        /// Allocates a VM for a user. If the pool has deallocated VMs, starts one and triggers pool replenishment.
-        /// If the pool is empty, creates a new running VM for the user and triggers creation of a deallocated VM for the pool.
+        /// Allocates a VM for a user. If the pool has deallocated VMs, starts one and returns it.
+        /// If the pool is empty, throws an exception.
         /// </summary>
         public async Task<VirtualMachineResource> AllocateVMFromPoolAsync()
         {
             _logger.LogInformation("Allocating VM from pool");
-            VirtualMachineResource vmToStart = null;
+            
+            // Get current pool status
+            var poolStatus = await GetPoolStatusAsync();
 
-            // LOCK SCOPE REDUCTION: Only use lock for the VM selection process
-            await using var vmAllocationLock = new DistributedLock(
-            _storageConnectionString, 
-            "vm-allocation-locks", 
-            "pool-allocation-lock", 
-            _logger);
-
-        // Add retry logic with exponential backoff
-        int maxRetries = 5;
-        int retryDelay = 1000; // ms
-        bool lockAcquired = false;
-
-        for (int attempt = 1; attempt <= maxRetries; attempt++)
-        {
-            try
+            // Check if there are any VMs available in the pool
+            if (poolStatus.DeallocatedVMs.Count > 0)
             {
-                // Try to acquire lock
-                if (await vmAllocationLock.AcquireAsync(15)) // 15 seconds is minimum valid lease time
-                {
-                    lockAcquired = true;
-                    _logger.LogInformation($"Lock acquired on attempt {attempt}");
-                    break; // Lock acquired, proceed with VM allocation
-                }
+                // Select a VM from the pool
+                var vmToStart = poolStatus.DeallocatedVMs[0];
+                _logger.LogInformation($"Selected VM from pool: {vmToStart.Data.Name}");
                 
-                // If we couldn't acquire the lock
-                if (attempt < maxRetries)
-                {
-                    _logger.LogInformation($"Lock acquisition attempt {attempt} failed, waiting for {retryDelay}ms before retry");
-                    await Task.Delay(retryDelay);
-                    retryDelay *= 2; // Exponential backoff
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning($"Error during lock acquisition attempt {attempt}: {ex.Message}");
-                if (attempt < maxRetries)
-                {
-                    _logger.LogInformation($"Waiting {retryDelay}ms before retry after error");
-                    await Task.Delay(retryDelay);
-                    retryDelay *= 2;
-                }
-                else if (attempt == maxRetries)
-                {
-                    throw;
-                }
-            }
-        }
-
-        // Check if lock was acquired after all retry attempts
-        if (!lockAcquired)
-        {
-            _logger.LogWarning($"Could not acquire lock for VM allocation after {maxRetries} attempts.");
-            throw new InvalidOperationException("Failed to acquire lock for VM allocation. Please try again in a few moments.");
-        }
-
-            // LOCK SCOPE REDUCTION: Only use lock for the VM selection process
-                try
-                {
-                    // Get current pool status
-                    var poolStatus = await GetPoolStatusAsync();
-
-                    if (poolStatus.DeallocatedVMs.Count > 0)
-                    {
-                        // Select a VM from the pool (fast operation)
-                        vmToStart = poolStatus.DeallocatedVMs[0];
-                        _logger.LogInformation($"Selected VM from pool: {vmToStart.Data.Name}");
-                        
-                        // Launch background pool maintenance if needed
-                        if (poolStatus.DeallocatedVMs.Count - 1 <= 2)
-                        {
-                            _ = Task.Run(async () => {
-                                try {
-                                    await EnsurePoolSizeAsync();
-                                } catch (Exception ex) {
-                                    _logger.LogError(ex, "Pool maintenance error");
-                                }
-                            });
-                        }
-                    }
-                }
-                finally
-                {
-                    // Lock is released automatically when leaving this block
-                }
-
-            // Start VM OUTSIDE the lock
-            if (vmToStart != null)
-            {
-                _logger.LogInformation($"Starting VM from pool: {vmToStart.Data.Name}");
-                await vmToStart.PowerOnAsync(Azure.WaitUntil.Completed);
+                // Start the VM with WaitUntil.Started instead of WaitUntil.Completed
+                // This returns control faster while the VM continues starting in the background
+                _logger.LogInformation($"Starting VM from pool: {vmToStart.Data.Name} (background operation)");
+                await vmToStart.PowerOnAsync(WaitUntil.Started);
+                
                 return vmToStart;
             }
             else
             {
-                // Create new VM if pool is empty (also outside lock)
-                // Create new VM if pool is empty (also outside lock)
-                _logger.LogInformation("Pool is empty, creating a new VM directly");
-            return await CreateAndReturnRunningVMAsync("user");
+                _logger.LogError("No VMs available in the pool. Automatic VM creation is DISABLED.");
+                throw new InvalidOperationException("No VMs available in the pool. New VMs will NOT be created automatically.");
             }
         }
-        /// <summary>
         /// Hibernates a VM instead of deallocating it
         /// </summary>
-            private async Task HibernateVMAsync(VirtualMachineResource vm)
+        private async Task HibernateVMAsync(VirtualMachineResource vm)
+        {
+            try
             {
-                try
-                {
-                    _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
-                    
-                    // Use deallocate with hibernate=true instead of PowerOff
-                    await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
-                    _logger.LogInformation($"Successfully hibernated VM {vm.Data.Name}");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Failed to hibernate VM {vm.Data.Name}. Attempting normal deallocate instead.");
-                    // Fallback to normal deallocation if hibernation fails
-                    await vm.DeallocateAsync(WaitUntil.Completed);
-                    _logger.LogInformation($"VM {vm.Data.Name} deallocated as fallback");
-                }
+                _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
+                
+                // Use deallocate with hibernate=true instead of PowerOff
+                await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
+                _logger.LogInformation($"Successfully hibernated VM {vm.Data.Name}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Failed to hibernate VM {vm.Data.Name}. Attempting normal deallocate instead.");
+                // Fallback to normal deallocation if hibernation fails
+                await vm.DeallocateAsync(WaitUntil.Completed);
+                _logger.LogInformation($"VM {vm.Data.Name} deallocated as fallback");
             }
         }
+    }
+
     
     
 

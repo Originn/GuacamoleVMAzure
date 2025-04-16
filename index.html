@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SolidCAM VM Portal</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f4f4; }
+        .container { max-width: 900px; margin: 30px auto; padding: 20px; box-shadow: 0 0 15px rgba(0,0,0,0.1); background-color: #fff; border-radius: 8px; }
+        .header { background-color: #0078D4; color: white; padding: 20px; margin: -20px -20px 20px -20px; border-radius: 8px 8px 0 0; }
+        .header h1 { margin: 0; font-size: 24px; }
+        .header p { margin: 5px 0 0 0; font-size: 14px; opacity: 0.9; }
+        .btn { background-color: #0078D4; color: white; padding: 12px 24px; border: none; cursor: pointer; font-size: 16px; margin-right: 10px; border-radius: 4px; transition: background-color 0.2s ease; }
+        .btn:hover:not(:disabled) { background-color: #005a9e; }
+        .btn:disabled { background-color: #cccccc; cursor: not-allowed; }
+        .btn-danger { background-color: #d9534f; }
+        .btn-danger:hover:not(:disabled) { background-color: #c9302c; }
+        .status { margin-top: 20px; padding: 15px; background-color: #e9f5fd; border-left: 5px solid #0078D4; font-size: 15px; }
+        .loading-spinner {
+            display: none;
+            width: 30px;
+            height: 30px;
+            margin: 20px auto;
+            border: 3px solid rgba(0, 0, 0, 0.1);
+            border-radius: 50%;
+            border-top: 3px solid #0078D4;
+            animation: spin 1s linear infinite;
+        }
+        .button-group {
+            display: flex;
+            margin-top: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .card {
+            margin-top: 20px;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #f9f9f9;
+        }
+        .action-buttons {
+            margin-top: 20px;
+        }
+        .btn-success {
+            background-color: #28a745;
+        }
+        .btn-success:hover:not(:disabled) {
+            background-color: #218838;
+        }
+        .open-tab-link {
+            display: inline-block;
+            margin-top: 15px;
+            padding: 12px 24px;
+            background-color: #28a745;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .open-tab-link:hover {
+            background-color: #218838;
+        }
+        .vm-info {
+            margin-top: 20px;
+            padding: 10px 15px;
+            background-color: #f8f9fa;
+            border-left: 5px solid #6c757d;
+            font-size: 14px;
+        }
+        .vm-credentials {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #fff3cd;
+            border-left: 5px solid #ffc107;
+            border-radius: 4px;
+        }
+        .credential-item {
+            margin-bottom: 10px;
+        }
+        .credential-label {
+            font-weight: bold;
+            display: inline-block;
+            width: 100px;
+        }
+        .credential-value {
+            font-family: monospace;
+            background-color: #f8f9fa;
+            padding: 4px 8px;
+            border-radius: 3px;
+            border: 1px solid #dee2e6;
+        }
+        .btn-sm {
+            padding: 4px 8px;
+            font-size: 12px;
+            margin-left: 5px;
+        }
+        .copy-success {
+            color: #28a745;
+            font-size: 12px;
+            margin-left: 5px;
+            display: none;
+        }
+        .pool-info {
+            margin-top: 15px;
+            padding: 12px;
+            background-color: #d1ecf1;
+            border-left: 5px solid #17a2b8;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .timer-display {
+            display: none;
+            margin-top: 15px;
+            padding: 10px 15px;
+            background-color: #e2e3e5;
+            border-left: 5px solid #5a6268;
+            border-radius: 4px;
+            font-size: 16px;
+            font-weight: bold;
+            text-align: center;
+        }
+        .timer-value {
+            color: #0078D4;
+            font-size: 20px;
+            font-family: monospace;
+        }
+        .deployment-metrics {
+            margin-top: 15px;
+            padding: 12px;
+            background-color: #e2e3e5;
+            border-left: 5px solid #5a6268;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>SolidCAM VM Deployment Portal</h1>
+            <p>Updated: April 4, 2025</p>
+        </div>
+
+        <p>Click the button below to create a new SolidCAM virtual machine. Thanks to our warm VM pool, deployment is now faster!</p>
+
+        <div class="pool-info">
+            <strong>🚀 Faster Deployment:</strong> We maintain a pool of pre-allocated VMs that are ready to start immediately when you need them. This significantly reduces waiting time compared to creating new VMs from scratch.
+        </div>
+
+        <div class="button-group">
+            <button id="deployBtn" class="btn">Deploy New SolidCAM VM</button>
+            <button id="stopVmBtn" class="btn btn-danger" style="display: none;">Stop & Delete VM</button>
+        </div>
+
+        <div id="status" class="status">Ready to deploy</div>
+        <div id="loadingSpinner" class="loading-spinner"></div>
+        
+        <!-- New timer display -->
+        <div id="timerDisplay" class="timer-display">
+            Deployment Time: <span id="timerValue" class="timer-value">00:00.00</span>
+        </div>
+
+        <div id="vmCard" class="card" style="display: none;">
+            <h3>VM Information</h3>
+            <div id="vmInfo" class="vm-info">
+                <!-- VM info will be inserted here -->
+            </div>
+            
+            <!-- New deployment metrics display -->
+            <div id="deploymentMetrics" class="deployment-metrics">
+                <strong>⏱️ Deployment Metrics:</strong>
+                <p>Total deployment time: <span id="finalDeploymentTime">--:--.-</span></p>
+            </div>
+            
+            <div id="vmCredentials" class="vm-credentials">
+                <h4>VM Credentials</h4>
+                <div class="credential-item">
+                    <span class="credential-label">Username:</span>
+                    <span id="vmUsername" class="credential-value">SolidCAMOperator</span>
+                    <button class="btn btn-sm" onclick="copyToClipboard('vmUsername')">Copy</button>
+                    <span id="usernameCopySuccess" class="copy-success">Copied!</span>
+                </div>
+                <div class="credential-item">
+                    <span class="credential-label">Password:</span>
+                    <span id="vmPassword" class="credential-value">••••••••</span>
+                    <button class="btn btn-sm" onclick="copyToClipboard('vmPassword')">Copy</button>
+                    <button class="btn btn-sm" onclick="togglePasswordVisibility()">Show/Hide</button>
+                    <span id="passwordCopySuccess" class="copy-success">Copied!</span>
+                </div>
+            </div>
+            
+            <div class="action-buttons">
+                <a id="openSessionLink" href="#" target="_blank" class="open-tab-link">Open Remote Session in New Tab</a>
+            </div>
+            <p style="margin-top: 15px; font-size: 14px;">
+                <b>Note:</b> If the remote session doesn't connect immediately, please wait 1-2 minutes for the VM to fully initialize and try again.
+                RDP connections may take a moment to establish after VM deployment.
+            </p>
+        </div>
+    </div>
+
+    <script>
+        const deployButton = document.getElementById('deployBtn');
+        const stopButton = document.getElementById('stopVmBtn');
+        const statusDiv = document.getElementById('status');
+        const loadingSpinner = document.getElementById('loadingSpinner');
+        const vmCard = document.getElementById('vmCard');
+        const vmInfoDiv = document.getElementById('vmInfo');
+        const vmUsername = document.getElementById('vmUsername');
+        const vmPassword = document.getElementById('vmPassword');
+        const openSessionLink = document.getElementById('openSessionLink');
+        const usernameCopySuccess = document.getElementById('usernameCopySuccess');
+        const passwordCopySuccess = document.getElementById('passwordCopySuccess');
+        const timerDisplay = document.getElementById('timerDisplay');
+        const timerValue = document.getElementById('timerValue');
+        const finalDeploymentTime = document.getElementById('finalDeploymentTime');
+
+        // URLs for the Function App
+        const deployUrl = 'https://solidcam-deploy-function-vnet.azurewebsites.net/api/DeployVM?code=2dmTawMxweB9gupfyBENmjicnTJQWkZXBmH4NnQGO2BSAzFuyKPwzQ==';        
+        const stopUrl = 'https://solidcam-deploy-function-vnet.azurewebsites.net/api/StopVM?code=Ah9stfgs3KCIwxfDW_0ke5ZQBvaSEWFzWPyPfP4RpLT4AzFuh9BoqQ==';
+        const guacamoleBaseUrl = 'https://solidcam-guac.northeurope.cloudapp.azure.com/guacamole';
+
+        // Password is initially hidden
+        let passwordVisible = false;
+        let actualPassword = '';
+        
+        // Timer variables
+        let deploymentStartTime = null;
+        let timerInterval = null;
+
+        // Start the timer
+        function startTimer() {
+            deploymentStartTime = new Date();
+            timerDisplay.style.display = 'block';
+            
+            // Clear any existing interval
+            if (timerInterval) clearInterval(timerInterval);
+            
+            // Update timer every 10ms
+            timerInterval = setInterval(updateTimer, 10);
+        }
+        
+        // Update the timer display
+        function updateTimer() {
+            if (!deploymentStartTime) return;
+            
+            const currentTime = new Date();
+            const elapsedMs = currentTime - deploymentStartTime;
+            
+            // Format as MM:SS.MS
+            const minutes = Math.floor(elapsedMs / 60000);
+            const seconds = Math.floor((elapsedMs % 60000) / 1000);
+            const milliseconds = Math.floor((elapsedMs % 1000) / 10);
+            
+            const formattedTime = 
+                (minutes < 10 ? '0' : '') + minutes + ':' +
+                (seconds < 10 ? '0' : '') + seconds + '.' +
+                (milliseconds < 10 ? '0' : '') + milliseconds;
+                
+            timerValue.textContent = formattedTime;
+        }
+        
+        // Stop the timer and return the final time
+        function stopTimer() {
+            if (!deploymentStartTime) return '00:00.00';
+            
+            clearInterval(timerInterval);
+            
+            const endTime = new Date();
+            const elapsedMs = endTime - deploymentStartTime;
+            
+            // Format final time
+            const minutes = Math.floor(elapsedMs / 60000);
+            const seconds = Math.floor((elapsedMs % 60000) / 1000);
+            const milliseconds = Math.floor((elapsedMs % 1000) / 10);
+            
+            const formattedTime = 
+                (minutes < 10 ? '0' : '') + minutes + ':' +
+                (seconds < 10 ? '0' : '') + seconds + '.' +
+                (milliseconds < 10 ? '0' : '') + milliseconds;
+            
+            return formattedTime;
+        }
+
+        // Function to copy text to clipboard
+        function copyToClipboard(elementId) {
+            let textToCopy = '';
+            let successElement = null;
+            
+            if (elementId === 'vmUsername') {
+                textToCopy = vmUsername.textContent;
+                successElement = usernameCopySuccess;
+            } else if (elementId === 'vmPassword') {
+                // Use the actual password stored in memory, not what's displayed
+                textToCopy = actualPassword;
+                successElement = passwordCopySuccess;
+            }
+            
+            // Create a temporary element for copying
+            const tempInput = document.createElement('textarea');
+            tempInput.value = textToCopy;
+            document.body.appendChild(tempInput);
+            tempInput.select();
+            document.execCommand('copy');
+            document.body.removeChild(tempInput);
+            
+            // Show success message
+            if (successElement) {
+                successElement.style.display = 'inline';
+                setTimeout(() => {
+                    successElement.style.display = 'none';
+                }, 2000);
+            }
+        }
+
+        // Function to toggle password visibility
+        function togglePasswordVisibility() {
+            passwordVisible = !passwordVisible;
+            vmPassword.textContent = passwordVisible ? actualPassword : '••••••••';
+        }
+
+        // Function to update VM info card
+        function updateVmCard(vmName, connectionId, authToken, username, password) {
+            if (!vmName) {
+                vmCard.style.display = 'none';
+                return;
+            }
+
+            const deploymentDate = new Date().toLocaleString();
+            
+            vmInfoDiv.innerHTML = `
+                <p><strong>VM Name:</strong> ${vmName}</p>
+                <p><strong>Status:</strong> Running</p>
+                <p><strong>Deployment Date:</strong> ${deploymentDate}</p>
+            `;
+
+            // Set credential values
+            vmUsername.textContent = username || 'SolidCAMOperator';
+            vmPassword.textContent = '••••••••';
+            actualPassword = password || '';
+            passwordVisible = false;
+
+            // Format the Guacamole URL
+            const baseUrl = guacamoleBaseUrl.endsWith('/') 
+                ? guacamoleBaseUrl.slice(0, -1) 
+                : guacamoleBaseUrl;
+            
+            openSessionLink.href = `${baseUrl}/#/client/${connectionId}?token=${authToken}`;
+            vmCard.style.display = 'block';
+            
+            // Stop the timer and display final time
+            const finalTime = stopTimer();
+            finalDeploymentTime.textContent = finalTime;
+        }
+
+        // Check sessionStorage on page load
+        const lastDeployment = sessionStorage.getItem('lastDeployment');
+        if (lastDeployment) {
+            try {
+                const data = JSON.parse(lastDeployment);
+                if (data.vmName) {
+                    stopButton.style.display = 'block';
+                    statusDiv.innerHTML = `VM ${data.vmName} deployed successfully! The VM is initializing and will be ready for connection in 1-2 minutes.`;
+                    
+                    if (data.guacamoleConnectionId && data.guacamoleAuthToken) {
+                        updateVmCard(
+                            data.vmName, 
+                            data.guacamoleConnectionId, 
+                            data.guacamoleAuthToken,
+                            data.vmUsername || 'SolidCAMOperator',
+                            data.vmPassword || ''
+                        );
+                    }
+                    
+                    // If a deployment time was saved, display it
+                    if (data.deploymentTime) {
+                        finalDeploymentTime.textContent = data.deploymentTime;
+                    }
+                }
+            } catch (e) {
+                console.error("Error parsing sessionStorage data:", e);
+                sessionStorage.removeItem('lastDeployment');
+            }
+        }
+
+        // Deploy Button Logic
+        deployButton.addEventListener('click', function() {
+            statusDiv.innerHTML = "Deploying VM from our warm pool... This typically takes 1-2 minutes. Please be patient.";
+            deployButton.disabled = true;
+            loadingSpinner.style.display = "block";
+            vmCard.style.display = 'none';
+            stopButton.style.display = 'none';
+            sessionStorage.removeItem('lastDeployment'); // Clear previous info
+            
+            // Start the deployment timer
+            startTimer();
+
+            fetch(deployUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({})
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.text().then(text => {
+                        let errorMsg = text || `HTTP error! status: ${response.status}`;
+                        try {
+                            const errorData = JSON.parse(text);
+                            if (errorData && errorData.error) { errorMsg = errorData.error; }
+                            else if (typeof errorData === 'object' && errorData !== null) { errorMsg = JSON.stringify(errorData); }
+                        } catch (e) { /* Ignore if not JSON */ }
+                        throw new Error(errorMsg);
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                loadingSpinner.style.display = "none";
+                
+                // Get final deployment time
+                const finalTime = stopTimer();
+                
+                // Add deployment time to data
+                data.deploymentTime = finalTime;
+                
+                // Save to session storage
+                sessionStorage.setItem('lastDeployment', JSON.stringify(data));
+                
+                if (data.vmName) {
+                    statusDiv.innerHTML = `VM ${data.vmName} deployed successfully! The VM is initializing and will be ready for connection in 1-2 minutes.`;
+                    stopButton.style.display = 'block';
+                    
+                    if (data.guacamoleConnectionId && data.guacamoleAuthToken) {
+                        // Store the actual password in memory
+                        actualPassword = data.vmPassword || '';
+                        
+                        updateVmCard(
+                            data.vmName, 
+                            data.guacamoleConnectionId, 
+                            data.guacamoleAuthToken,
+                            data.vmUsername || 'SolidCAMOperator',
+                            data.vmPassword || ''
+                        );
+                    } else {
+                        console.error("Guacamole connection details missing from function response:", data);
+                        statusDiv.innerHTML += " However, remote session details could not be retrieved. Check Azure Function logs.";
+                    }
+                } else {
+                    statusDiv.innerHTML = "Deployment completed but no VM information was returned. Check Azure Function logs.";
+                }
+                
+                deployButton.disabled = false;
+            })
+            .catch(error => {
+                loadingSpinner.style.display = "none";
+                stopTimer(); // Stop the timer on error
+                timerDisplay.style.display = 'none'; // Hide the timer
+                statusDiv.innerHTML = "Error during deployment: " + error.message;
+                console.error("Deployment Fetch Error:", error);
+                deployButton.disabled = false;
+            });
+        });
+
+        // Stop Button Logic
+        stopButton.addEventListener('click', function() {
+            if (confirm('Are you sure you want to stop and DELETE this VM? This will terminate your session and delete all data on the VM.')) {
+                const data = JSON.parse(sessionStorage.getItem('lastDeployment') || '{}');
+                
+                if (!data.vmName) {
+                    alert('No VM information found to stop.');
+                    stopButton.style.display = 'none';
+                    return;
+                }
+
+                stopButton.disabled = true;
+                deployButton.disabled = true;
+                statusDiv.innerHTML = "Stopping and deleting VM... Please wait.";
+                vmCard.style.display = 'none';
+                timerDisplay.style.display = 'none'; // Hide the timer 
+                loadingSpinner.style.display = 'block';
+
+                fetch(stopUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'include',
+                    body: JSON.stringify({
+                        vmName: data.vmName,
+                        resourceGroup: data.resourceGroup || "SolidCAM-Golden-Image_group"
+                    })
+                })
+                .then(response => {
+                    if (!response.ok) {
+                         return response.text().then(text => {
+                             let errorMsg = text || `HTTP error! status: ${response.status}`;
+                             try {
+                                 const errorData = JSON.parse(text);
+                                 if (errorData && errorData.error) { errorMsg = errorData.error; }
+                                 else if (typeof errorData === 'object' && errorData !== null) { errorMsg = JSON.stringify(errorData); }
+                             } catch(e) { /* Ignore */ }
+                             throw new Error(errorMsg);
+                         });
+                    }
+                    return response.text();
+                })
+                .then(() => {
+                    statusDiv.innerHTML = "VM stopped and deleted successfully. Ready to deploy a new one.";
+                    stopButton.style.display = 'none';
+                    loadingSpinner.style.display = 'none';
+                    deployButton.disabled = false;
+                    actualPassword = '';
+                    sessionStorage.removeItem('lastDeployment');
+                })
+                .catch(error => {
+                    statusDiv.innerHTML = "Error stopping/deleting VM: " + error.message;
+                    console.error("Stop VM Fetch Error:", error);
+                    stopButton.disabled = false;
+                    deployButton.disabled = false;
+                    loadingSpinner.style.display = 'none';
+                });
+            }
+        });
+    </script>
+</body>
+</html>

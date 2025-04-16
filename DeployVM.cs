@@ -176,8 +176,22 @@ namespace DeployVMFunction
                     log.LogInformation($"VM {vmName} is not in a hibernated state. It should be running already.");
                 }
                 
+                // Run a quick RDP service activation on a separate thread to help speed up availability
+                _ = Task.Run(async () => {
+                    try {
+                        log.LogInformation($"Running proactive RDP service check and activation for {vmName}...");
+                        var proactiveScript = @"$s = Get-Service -Name 'TermService' -EA SilentlyContinue; if ($s) { Start-Service -Name 'TermService' -Force; Set-Service -Name 'TermService' -StartupType Automatic; Write-Output 'PREEMPTIVE_RDP_SERVICE_START' } else { Write-Output 'RDP_SERVICE_NOT_FOUND' }";
+                        var cmdInput = new RunCommandInput("RunPowerShellScript");
+                        cmdInput.Script.Add(proactiveScript);
+                        await vm.RunCommandAsync(WaitUntil.Started, cmdInput);
+                    } catch (Exception ex) {
+                        log.LogWarning(ex, $"Could not run proactive RDP service start for {vmName}");
+                    }
+                });
+                
+                
                 log.LogInformation($"Waiting for VM {vmName} to complete boot process and initialize RDP service...");
-                int attempts = 0, maxAttempts = 40;
+                int attempts = 0, maxAttempts = 20; // Reduced from 40 to 20 attempts
                 bool isRdpReady = false;
                 while (!isRdpReady && attempts < maxAttempts)
                 {
@@ -185,7 +199,8 @@ namespace DeployVMFunction
                     {
                         using var tcpClient = new TcpClient();
                         var connectTask = tcpClient.ConnectAsync(targetVmPrivateIp, 3389);
-                        if (await Task.WhenAny(connectTask, Task.Delay(5000)) == connectTask && connectTask.IsCompletedSuccessfully) {
+                        // Reduce timeout from 5000ms to 3000ms
+                        if (await Task.WhenAny(connectTask, Task.Delay(3000)) == connectTask && connectTask.IsCompletedSuccessfully) {
                             isRdpReady = true;
                             log.LogInformation($"RDP port on {vmName} ({targetVmPrivateIp}) is responding after {attempts + 1} attempts.");
                             tcpClient.Close();
@@ -197,15 +212,17 @@ namespace DeployVMFunction
                         attempts++;
                         log.LogInformation($"Waiting for RDP service on {vmName}... Attempt {attempts}/{maxAttempts} - ({ex.GetType().Name})");
                         if (attempts >= maxAttempts) break;
-                        await Task.Delay(6000);
+                        // Reduce delay between attempts from 6000ms to 3000ms
+                        await Task.Delay(3000);
 
                         // RDP Service Check via RunCommand (only at half attempts)
-                        if (attempts == maxAttempts / 2)
+                        if (attempts == maxAttempts / 4 || attempts == maxAttempts / 2)
                         {
-                            log.LogInformation($"Halfway through RDP polling attempts for {vmName}. Running service check script...");
+                            log.LogInformation($"Running service check script at attempt {attempts}/{maxAttempts} for {vmName}...");
                             try
                             {
-                                var checkScript = @"$s = Get-Service -Name 'TermService' -EA SilentlyContinue; if ($s -and $s.Status -eq 'Running') { Write-Output 'RDP_SERVICE_RUNNING' } else { Write-Output 'RDP_SERVICE_NOT_RUNNING' }";
+                                // Enhanced script to not only check but also ensure RDP service is running
+                                var checkScript = @"$s = Get-Service -Name 'TermService' -EA SilentlyContinue; if ($s) { if ($s.Status -ne 'Running') { Start-Service -Name 'TermService' -Force; Write-Output 'RDP_SERVICE_STARTED' } else { Write-Output 'RDP_SERVICE_RUNNING' } } else { Write-Output 'RDP_SERVICE_NOT_FOUND' }";
                                 var cmdInput = new RunCommandInput("RunPowerShellScript");
                                 cmdInput.Script.Add(checkScript);
 
@@ -224,33 +241,10 @@ namespace DeployVMFunction
                     }
                 }
 
-                // Get the VM password from storage - this should ALWAYS be done for pool VMs
-                randomPassword = Program.GetVMPassword(vmName, log);
+                // Always use the default password
+                randomPassword = "Rt@wqPP7ZvUgtS7"; // Default password
+                log.LogInformation($"Using default password for VM {vmName}");
                 
-                // If no password was found in storage, generate one and configure the user accounts
-                if (string.IsNullOrEmpty(randomPassword))
-                {
-                    log.LogWarning($"No stored password found for VM {vmName}. Generating and configuring a new password.");
-                    randomPassword = Program.GenerateSecurePassword(16);
-                    
-                    // Configure the multiple SolidCAMOperator accounts with the new password
-                    bool configSuccess = await Program.ConfigureMultiUserAccountsAsync(vm, randomPassword, log);
-                    
-                    if (configSuccess)
-                    {
-                        // Store the password for future use
-                        await Program.StoreVMPasswordAsync(vmName, randomPassword, log);
-                        log.LogInformation($"Successfully configured and stored new password for VM {vmName}");
-                    }
-                    else
-                    {
-                        log.LogError($"Failed to configure user accounts for VM {vmName}. Deployment might fail.");
-                    }
-                }
-                else
-                {
-                    log.LogInformation($"Retrieved existing password for VM {vmName} from storage");
-                }
                 // --- Prepare Guacamole token authentication ---
                 log.LogInformation($"Preparing Guacamole connection for VM {vmName} ({targetVmPrivateIp})...");
                 string tokenUrl = $"{guacamoleApiBaseUrl.TrimEnd('/')}/api/tokens";
@@ -350,7 +344,7 @@ namespace DeployVMFunction
                     vmUsername = targetUsername,
                     vmPassword = randomPassword,
                     vmSize = vm.Data?.HardwareProfile?.VmSize?.ToString() ?? "Unknown",
-                    provisioningDurationEstimate = $"{attempts * 6} seconds"
+                    provisioningDurationEstimate = $"{attempts * 3} seconds"
                 });
                 return responseOk;
             }

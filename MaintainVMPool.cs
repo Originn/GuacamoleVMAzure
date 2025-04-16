@@ -32,12 +32,11 @@ namespace DeployVMFunction
                                      $"{poolStatus.RunningVMs.Count} running VMs, " +
                                      $"{poolStatus.TransitioningVMs.Count} transitioning VMs, " +
                                      $"{poolStatus.OtherVMs.Count} other SolidCAM VMs");
-                // Check for VMs without configured passwords
-                logger.LogInformation("Checking if existing pool VMs need password configuration...");
-                await ConfigureExistingVMsAsync(poolStatus.DeallocatedVMs, logger);
-                await ConfigureExistingVMsAsync(poolStatus.RunningVMs, logger);
+                // DISABLED: Skipping user account configuration and using default password
+                // logger.LogInformation("Checking if existing pool VMs need password configuration...");
+                // await ConfigureExistingVMsAsync(poolStatus.DeallocatedVMs, logger);
+                // await ConfigureExistingVMsAsync(poolStatus.RunningVMs, logger);
                 
-                // Ensure we maintain the pool size on startup
                 logger.LogInformation("Ensuring minimum pool size is maintained during initialization...");
                 await EnsurePoolSizeWithPasswordsAsync(poolManager, logger);
                 
@@ -146,7 +145,8 @@ namespace DeployVMFunction
                         }
                         
                         // Generate and configure the user accounts
-                        string password = Program.GenerateSecurePassword(16);
+                        // Use default password instead of generating one
+                        string password = "Rt@wqPP7ZvUgtS7"; // Program.GenerateSecurePassword(16);
                         bool configSuccess = await Program.ConfigureMultiUserAccountsAsync(vm, password, logger);
                         if (configSuccess)
                         {
