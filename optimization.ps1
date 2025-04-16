@@ -1,5 +1,23 @@
 # optimization.ps1
 
+# Script execution logging
+$scriptLogPath = "C:\ProgramData\SolidCAM\script_execution_log.txt"
+$proofPath = "C:\ProgramData\SolidCAM\script_execution_proofs"
+
+# Create directories if they don't exist
+if (!(Test-Path (Split-Path -Parent $scriptLogPath))) {
+    New-Item -Path (Split-Path -Parent $scriptLogPath) -ItemType Directory -Force | Out-Null
+}
+if (!(Test-Path $proofPath)) {
+    New-Item -Path $proofPath -ItemType Directory -Force | Out-Null
+}
+
+# Log script execution start
+$startTime = Get-Date
+Add-Content -Path $scriptLogPath -Value "Script execution: $startTime - optimization.ps1 starting"
+Write-Output "=== SCRIPT-ID: optimization.ps1 starting execution at $startTime ==="
+
+
 Write-Output "=== Starting persistent VM optimizations ==="
 
 # 1. Configure Windows boot settings for faster startup
@@ -64,15 +82,17 @@ Register-ScheduledTask -TaskName "SolidCAM-StartupOptimizer" `
                       -Principal $principal `
                       -Force
 
-# 7. Remove old ShopFloorEditor auto-launch entries and run it once before hibernation
-Write-Output "7) Setting up ShopFloorEditor for hibernation test..."
+# 7. Prepare ShopFloorEditor for hibernation
+Write-Output "7) Setting up ShopFloorEditor for hibernation..."
 $editorPath = "C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe"
 
 # Clean up any existing auto-launch entries
 Write-Output "Cleaning up any existing auto-launch entries..."
 
 # Remove any existing scheduled tasks
-Get-ScheduledTask | Where-Object { $_.TaskName -like "*ShopFloorEditor*" } | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+Get-ScheduledTask | Where-Object { $_.TaskName -like "*ShopFloorEditor*" } | 
+    Where-Object { $_.TaskName -ne "SolidCAM-PostHibernateCheck" } | 
+    Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 
 # Remove any registry auto-start entries
 Write-Output "Removing registry auto-start entries..."
@@ -88,45 +108,96 @@ Write-Output "Removing startup shortcuts..."
 $startupFolder = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
 Remove-Item "$startupFolder\LaunchShopFloorEditor*.lnk" -Force -ErrorAction SilentlyContinue
 
-# Launch ShopFloorEditor for SolidCAMOperator1 only before hibernation
+# Ensure hibernation is properly configured
+Write-Output "Verifying hibernation is properly configured..."
+
+# Check if hibernation is enabled
+$hibernateStatus = powercfg /a | Select-String "Hibernate"
+if ($hibernateStatus -match "Hibernation is not available") {
+    Write-Output "Hibernation not available. Enabling..."
+    powercfg /hibernate on
+} else {
+    Write-Output "Hibernation is available"
+}
+
+# Set hibernation type to 'full' (required for application state preservation)
+Write-Output "Setting hibernation type to full..."
+powercfg /h /type full
+
+# Launch ShopFloorEditor for SolidCAMOperator1 before hibernation
 Write-Output "Running ShopFloorEditor for SolidCAMOperator1 before hibernation..."
 
-# Use PSExec-like functionality to launch the app in the SolidCAMOperator1 session
-$runAsUserScript = @"
-@echo off
-C:\Windows\System32\query.exe session SolidCAMOperator1 > %TEMP%\session.txt
-for /f "tokens=2" %%i in ('type %TEMP%\session.txt ^| find "SolidCAMOperator1"') do set SESSION=%%i
-if defined SESSION (
-    C:\Windows\System32\wmic.exe path win32_process call create "$editorPath" /user:SolidCAMOperator1 
-    echo Started ShopFloorEditor for SolidCAMOperator1
-) else (
-    echo SolidCAMOperator1 not logged in
-)
-del %TEMP%\session.txt
-"@
-
-$scriptPath = "C:\ProgramData\SolidCAM\RunAsSolidCAMOperator1.bat"
-if (!(Test-Path "C:\ProgramData\SolidCAM")) {
-    New-Item -Path "C:\ProgramData\SolidCAM" -ItemType Directory -Force | Out-Null
-}
-Set-Content -Path $scriptPath -Value $runAsUserScript -Force
-
-# Try to run the script
-try {
-    Start-Process -FilePath $scriptPath -Wait -NoNewWindow
-    Write-Output "ShopFloorEditor launch attempt completed."
+# Check if ShopFloorEditor is already running
+$shopFloorProcess = Get-Process -Name "ShopFloorEditor" -ErrorAction SilentlyContinue
+if ($shopFloorProcess) {
+    Write-Output "ShopFloorEditor is already running with PID: $($shopFloorProcess.Id)"
+} else {
+    # Try to detect if SolidCAMOperator1 is logged in
+    # Try to detect if SolidCAMOperator1 is logged in
+    query session SolidCAMOperator1 2>$null
     
-    # Alternative method - check if user is logged in and launch directly
-    query session SolidCAMOperator1 >$null 2>$null
     if ($LASTEXITCODE -eq 0) {
-        Write-Output "SolidCAMOperator1 is logged in, launching ShopFloorEditor directly..."
-        Start-Process -FilePath $editorPath
-        Write-Output "ShopFloorEditor launched directly."
+        Write-Output "SolidCAMOperator1 is logged in, launching ShopFloorEditor..."
+        try {
+            # Launch directly since operator is logged in
+            Start-Process -FilePath $editorPath
+            Start-Sleep -Seconds 3  # Give it time to start
+            
+            # Verify it's running
+            $newProcess = Get-Process -Name "ShopFloorEditor" -ErrorAction SilentlyContinue
+            if ($newProcess) {
+                Write-Output "ShopFloorEditor successfully started with PID: $($newProcess.Id)"
+            } else {
+                Write-Output "WARNING: Failed to start ShopFloorEditor"
+            }
+        } catch {
+            Write-Output "Error launching ShopFloorEditor: $_"
+        }
     } else {
-        Write-Output "SolidCAMOperator1 not logged in, can't launch ShopFloorEditor at this time."
+        Write-Output "SolidCAMOperator1 not logged in, cannot launch ShopFloorEditor in user context"
+        Write-Output "Will create startup task instead"
+        
+        # Create a task to launch ShopFloorEditor at user logon
+        $taskName = "SolidCAM-LaunchShopFloorEditor"
+        $taskExists = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        
+        if ($taskExists) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+        }
+        
+        $action = New-ScheduledTaskAction -Execute $editorPath
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User "SolidCAMOperator1"
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+        $principal = New-ScheduledTaskPrincipal -UserId "SolidCAMOperator1" -LogonType Interactive -RunLevel Highest
+        
+        Register-ScheduledTask -TaskName $taskName `
+                             -Action $action `
+                             -Trigger $trigger `
+                             -Settings $settings `
+                             -Principal $principal `
+                             -Force
+                             
+        Write-Output "Created logon task to launch ShopFloorEditor for SolidCAMOperator1"
     }
-} catch {
-    Write-Output "Error launching ShopFloorEditor: $_"
 }
+
+# Run the dedicated hibernation setup script if it exists
+$hibernationSetupScript = "C:\users\ori.somekh\desktop\solidcamfunctionapp\hibernation_setup.ps1"
+if (Test-Path $hibernationSetupScript) {
+    Write-Output "Running dedicated hibernation setup script..."
+    & $hibernationSetupScript
+} else {
+    Write-Output "Hibernation setup script not found. This is okay if you're not using advanced hibernation features."
+}
+
 
 Write-Output "=== Persistent VM optimization completed ==="
+
+# Log script execution end
+$endTime = Get-Date
+Add-Content -Path $scriptLogPath -Value "Script execution: $endTime - optimization.ps1 completed"
+Write-Output "=== SCRIPT-ID: optimization.ps1 completed execution at $endTime ==="
+
+# Create a proof file for this execution
+Set-Content -Path "$proofPath\optimization_ran_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt" -Value "Script executed from $startTime to $endTime
+Optimization results: Boot optimized, Services configured, ShopFloorEditor running: $($null -ne $shopFloorProcess)"
