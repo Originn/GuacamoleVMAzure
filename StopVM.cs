@@ -21,6 +21,7 @@ namespace DeployVMFunction
     {
         public string? vmName { get; set; }
         public string? resourceGroup { get; set; }
+        public string? username { get; set; }  // Username to release (e.g., SolidCAMOperator2)
     }
 
     public static class StopVM
@@ -111,8 +112,72 @@ namespace DeployVMFunction
 
                 VirtualMachineResource vm = await vmCollection.GetAsync(vmName);
                 
+                // If username was provided, we'll just release that account and not delete the VM
+                // Get username from the request data
+                string? username = null;
+                try {
+                    var reqData = await req.ReadFromJsonAsync<StopVMRequest>();
+                    username = reqData?.username;
+                } catch {
+                    // If we can't read the username, we'll just proceed with the VM deletion
+                    log.LogWarning("Could not read username from request, will proceed with VM deletion");
+                }
+                if (!string.IsNullOrEmpty(username) && username.StartsWith("SolidCAMOperator"))
+                {
+                    log.LogInformation($"Username {username} provided - will just release this account instead of deleting VM");
+                    
+                    // Try to parse the account number
+                    if (int.TryParse(username.Replace("SolidCAMOperator", ""), out int accountNumber) &&
+                        accountNumber >= 1 && accountNumber <= 3)
+                    {
+                        try
+                        {
+                            // Initialize VM assignment tracker
+                            var storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+                            if (!string.IsNullOrEmpty(storageConnectionString))
+                            {
+                                log.LogInformation($"Releasing account {username} (account #{accountNumber}) on VM {vmName}");
+                                var assignmentTracker = new VMAssignmentTracker(log, storageConnectionString);
+                                await assignmentTracker.ReleaseAccountOnVMAsync(vmName, accountNumber);
+                                
+                                var releaseResponse = req.CreateResponse(HttpStatusCode.OK);
+                                releaseResponse.Headers.Add("Access-Control-Allow-Origin", "https://solidcamportal743899.z16.web.core.windows.net");
+                                releaseResponse.Headers.Add("Access-Control-Allow-Credentials", "true");
+                                await releaseResponse.WriteAsJsonAsync(new {
+                                    status = "success",
+                                    message = $"User account {username} released on VM {vmName}"
+                                });
+                                return releaseResponse;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            log.LogError(ex, $"Error releasing user account {username} on VM {vmName}");
+                            // Continue with VM deletion as fallback
+                        }
+                    }
+                }
+                
+                // If we get here, we're deleting the entire VM (either no username or failed to release)
                 // Store network interface IDs before deleting the VM
                 var networkInterfaceIds = vm.Data.NetworkProfile.NetworkInterfaces.Select(ni => ni.Id).ToList();
+
+                // Release all VM accounts in the tracker if available
+                try
+                {
+                    var storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+                    if (!string.IsNullOrEmpty(storageConnectionString))
+                    {
+                        log.LogInformation($"Marking VM {vmName} as deleted in assignment tracker");
+                        var assignmentTracker = new VMAssignmentTracker(log, storageConnectionString);
+                        await assignmentTracker.MarkVMAsDeletedAsync(vmName);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log.LogWarning(ex, $"Failed to mark VM {vmName} as deleted in assignment tracker. Continuing with deletion.");
+                }
+                // Network interface IDs already stored above
 
                 // Delete the VM (instead of just deallocating it)
                 log.LogInformation($"Deleting VM: {vmName}");

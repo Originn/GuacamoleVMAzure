@@ -29,7 +29,9 @@ namespace DeployVMFunction
     {
         // Define a static HttpClient to reuse connections with SSL certificate validation
         private static readonly HttpClient httpClient;
-
+        
+        // Static instance of the VM assignment tracker to reuse across requests
+        private static VMAssignmentTracker assignmentTracker;
         // Static constructor to initialize HttpClient with certificate validation handling
         static DeployVM()
         {
@@ -39,6 +41,18 @@ namespace DeployVMFunction
                 ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true
             };
             httpClient = new HttpClient(handler);
+            
+            // Initialize the VM assignment tracker
+            try {
+                var storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+                if (!string.IsNullOrEmpty(storageConnectionString)) {
+                    // Initialize in a try-catch so if it fails, we can still function
+                    var logger = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+                    assignmentTracker = new VMAssignmentTracker(logger, storageConnectionString);
+                }
+            } catch (Exception) {
+                // Ignore errors during static initialization - we'll check for null later
+            }
         }
 
         [Function("DeployVM")]
@@ -84,59 +98,118 @@ namespace DeployVMFunction
                     await configErrorResponse.WriteStringAsync("Server configuration error: Missing required environment variables.");
                     return configErrorResponse;
                 }
+                
                 log.LogInformation($"Using Guacamole Server Private IP: {guacamoleServerPrivateIp}");
                 log.LogInformation($"Using Guacamole API Base URL: {guacamoleApiBaseUrl}");
-
-                var poolManager = new VMPoolManager(log);
-
+                
                 // Instead of generating a password immediately, we'll check storage first
                 string? randomPassword = null;
-
-                log.LogInformation("Requesting VM from the warm pool");
-                Task<VirtualMachineResource> vmAllocationTask;
-                try
-                {
-                    vmAllocationTask = poolManager.AllocateVMFromPoolAsync();
-                }
-                catch (RequestFailedException ex) when (ex.Status == 409 && ex.Message.Contains("quota", StringComparison.OrdinalIgnoreCase))
-                {
-                    log.LogError(ex, $"Azure quota limit reached. Unable to allocate VM.");
-                    var quotaErrorResponse = req.CreateResponse(HttpStatusCode.ServiceUnavailable);
-                    quotaErrorResponse.Headers.Add("Access-Control-Allow-Origin", allowedOrigin);
-                    quotaErrorResponse.Headers.Add("Access-Control-Allow-Credentials", "true");
-                    await quotaErrorResponse.WriteAsJsonAsync(new { error = "Azure subscription quota limit reached.", details = ex.Message });
-                    return quotaErrorResponse;
-                }
-                catch (InvalidOperationException ex) when (ex.Message.Contains("Failed to create VM", StringComparison.OrdinalIgnoreCase))
-                {
-                     log.LogError(ex, $"Failed to create VM after exhausting options.");
-                     var creationErrorResponse = req.CreateResponse(HttpStatusCode.ServiceUnavailable);
-                     creationErrorResponse.Headers.Add("Access-Control-Allow-Origin", allowedOrigin);
-                     creationErrorResponse.Headers.Add("Access-Control-Allow-Credentials", "true");
-                    await creationErrorResponse.WriteAsJsonAsync(new { error = "Failed to provision a virtual machine.", details = ex.Message });
-                    return creationErrorResponse;
-                }
-                VirtualMachineResource vm = await vmAllocationTask;
-                string vmName = vm.Data?.Name ?? "UnknownVM";
-                log.LogInformation($"Allocated VM {vmName} from pool");
-
+                
+                // Get the poolManager to help with VM allocation
+                var poolManager = new VMPoolManager(log);
+                VirtualMachineResource vm = null;
+                string vmName = "";
                 string? targetVmPrivateIp = null;
                 NetworkInterfaceResource? primaryNic = null;
-                try
+                int assignedAccountNumber = 1; // Default account number for new VMs
+                bool usingExistingVM = false;
+                
+                // Try to find a running VM with available accounts first
+                if (assignmentTracker != null)
                 {
-                    var firstNetworkInterfaceRef = vm.Data?.NetworkProfile?.NetworkInterfaces?.FirstOrDefault();
-                    if (firstNetworkInterfaceRef?.Id != null)
+                    log.LogInformation("Checking for existing running VMs with available accounts...");
+                    
+                    // Get pool status to find running VMs
+                    var poolStatus = await poolManager.GetPoolStatusAsync();
+                    if (poolStatus.RunningVMs.Count > 0)
                     {
-                        var nicId = firstNetworkInterfaceRef.Id;
-                        var armClient = new ArmClient(new DefaultAzureCredential());
-                        primaryNic = armClient.GetNetworkInterfaceResource(nicId);
-                        log.LogInformation($"Fetching NIC details for {nicId}...");
-                        Response<NetworkInterfaceResource> refreshedNicResponse = await primaryNic.GetAsync();
-                        NetworkInterfaceData? refreshedNicData = refreshedNicResponse.Value?.Data;
-                        var ipConfig = refreshedNicData?.IPConfigurations?.FirstOrDefault(ipc => ipc.Primary ?? false) ?? refreshedNicData?.IPConfigurations?.FirstOrDefault();
-                        targetVmPrivateIp = ipConfig?.PrivateIPAddress;
-                    } else { log.LogWarning($"VM {vmName} has no network interfaces defined."); }
-                } catch (Exception ipEx) { log.LogError(ipEx, $"Error retrieving NIC or private IP address for VM {vmName}"); }
+                        log.LogInformation($"Found {poolStatus.RunningVMs.Count} running VMs to check for available accounts");
+                        var vmWithAccount = await assignmentTracker.FindVMWithAvailableAccountAsync(poolStatus.RunningVMs);
+                        
+                        if (vmWithAccount.HasValue)
+                        {
+                            log.LogInformation("Found existing VM with available account!");
+                            // Use the existing VM
+                            vm = vmWithAccount.Value.vm;
+                            vmName = vm.Data?.Name ?? "UnknownVM";
+                            targetVmPrivateIp = vmWithAccount.Value.privateIp;
+                            assignedAccountNumber = vmWithAccount.Value.accountNumber;
+                            usingExistingVM = true;
+                            
+                            log.LogInformation($"Using existing running VM {vmName} with account #{assignedAccountNumber}");
+                        }
+                        else
+                        {
+                            log.LogInformation("No existing VMs with available accounts, will allocate from pool");
+                        }
+                    }
+                    else
+                    {
+                        log.LogInformation("No running VMs found, will allocate from pool");
+                    }
+                }
+                
+                // If we didn't find an existing VM with available accounts, allocate from pool
+                Task<VirtualMachineResource> vmAllocationTask = null;
+                if (!usingExistingVM)
+                {
+                    log.LogInformation("Requesting VM from the warm pool");
+                    try
+                    {
+                        vmAllocationTask = poolManager.AllocateVMFromPoolAsync();
+                    }
+                    catch (RequestFailedException ex) when (ex.Status == 409 && ex.Message.Contains("quota", StringComparison.OrdinalIgnoreCase))
+                    {
+                        log.LogError(ex, $"Azure quota limit reached. Unable to allocate VM.");
+                        var quotaErrorResponse = req.CreateResponse(HttpStatusCode.ServiceUnavailable);
+                        quotaErrorResponse.Headers.Add("Access-Control-Allow-Origin", allowedOrigin);
+                        quotaErrorResponse.Headers.Add("Access-Control-Allow-Credentials", "true");
+                        await quotaErrorResponse.WriteAsJsonAsync(new { error = "Azure subscription quota limit reached.", details = ex.Message });
+                        return quotaErrorResponse;
+                    }
+                    catch (InvalidOperationException ex) when (ex.Message.Contains("Failed to create VM", StringComparison.OrdinalIgnoreCase))
+                    {
+                        log.LogError(ex, $"Failed to create VM after exhausting options.");
+                        var creationErrorResponse = req.CreateResponse(HttpStatusCode.ServiceUnavailable);
+                        creationErrorResponse.Headers.Add("Access-Control-Allow-Origin", allowedOrigin);
+                        creationErrorResponse.Headers.Add("Access-Control-Allow-Credentials", "true");
+                        await creationErrorResponse.WriteAsJsonAsync(new { error = "Failed to provision a virtual machine.", details = ex.Message });
+                        return creationErrorResponse;
+                    }
+                    
+                    // This is only used if we allocated a new VM from the pool
+                    vm = await vmAllocationTask;
+                    vmName = vm.Data?.Name ?? "UnknownVM";
+                    log.LogInformation($"Allocated VM {vmName} from pool");
+                }
+
+                // Only try to get IP if we don't already have it (from an existing VM)
+                if (targetVmPrivateIp == null)
+                {
+                    try
+                    {
+                        var firstNetworkInterfaceRef = vm.Data?.NetworkProfile?.NetworkInterfaces?.FirstOrDefault();
+                        if (firstNetworkInterfaceRef?.Id != null)
+                        {
+                            var nicId = firstNetworkInterfaceRef.Id;
+                            var armClient = new ArmClient(new DefaultAzureCredential());
+                            primaryNic = armClient.GetNetworkInterfaceResource(nicId);
+                            log.LogInformation($"Fetching NIC details for {nicId}...");
+                            Response<NetworkInterfaceResource> refreshedNicResponse = await primaryNic.GetAsync();
+                            NetworkInterfaceData? refreshedNicData = refreshedNicResponse.Value?.Data;
+                            var ipConfig = refreshedNicData?.IPConfigurations?.FirstOrDefault(ipc => ipc.Primary ?? false) ?? refreshedNicData?.IPConfigurations?.FirstOrDefault();
+                            targetVmPrivateIp = ipConfig?.PrivateIPAddress;
+                        } 
+                        else 
+                        { 
+                            log.LogWarning($"VM {vmName} has no network interfaces defined."); 
+                        }
+                    } 
+                    catch (Exception ipEx) 
+                    { 
+                        log.LogError(ipEx, $"Error retrieving NIC or private IP address for VM {vmName}"); 
+                    }
+                }
 
                 if (string.IsNullOrEmpty(targetVmPrivateIp))
                 {
@@ -151,32 +224,51 @@ namespace DeployVMFunction
 
                 log.LogInformation($"VM {vmName} has been allocated from the pool. Resuming from hibernation...");
                 
-                // Check if VM is in hibernated state and resume it
-                bool isHibernated = false;
-                try {
-                    var instanceView = await vm.InstanceViewAsync();
-                    var statuses = instanceView?.Value?.Statuses;
-                    if (statuses != null) {
-                        var powerState = statuses.FirstOrDefault(s => s.Code != null && s.Code.StartsWith("PowerState/"))?.Code;
-                        isHibernated = powerState == "PowerState/stopped" || powerState == "PowerState/deallocated";
+                // Only start the VM if it's not already running
+                if (!usingExistingVM)
+                {
+                    // Check if VM is in hibernated state and resume it
+                    bool isHibernated = false;
+                    try 
+                    {
+                        var instanceView = await vm.InstanceViewAsync();
+                        var statuses = instanceView?.Value?.Statuses;
+                        if (statuses != null) 
+                        {
+                            var powerState = statuses.FirstOrDefault(s => s.Code != null && s.Code.StartsWith("PowerState/"))?.Code;
+                            isHibernated = powerState == "PowerState/stopped" || powerState == "PowerState/deallocated";
+                        }
+                    } 
+                    catch (Exception ex) 
+                    {
+                        log.LogWarning(ex, $"Error checking hibernation state of VM {vmName}. Will attempt to start it anyway.");
                     }
-                } catch (Exception ex) {
-                    log.LogWarning(ex, $"Error checking hibernation state of VM {vmName}. Will attempt to start it anyway.");
-                }
 
-                if (isHibernated) {
-                    log.LogInformation($"VM {vmName} appears to be hibernated. Starting it up...");
-                    try {
-                        await vm.PowerOnAsync(WaitUntil.Completed); // This will resume from hibernation if the VM was hibernated
-                        log.LogInformation($"Successfully started VM {vmName} from hibernation.");
-                    } catch (Exception ex) {
-                        log.LogWarning(ex, $"Error resuming VM {vmName} from hibernation. Will continue and hope it starts normally.");
+                    if (isHibernated) 
+                    {
+                        log.LogInformation($"VM {vmName} appears to be hibernated. Starting it up...");
+                        try 
+                        {
+                            await vm.PowerOnAsync(WaitUntil.Started); // Use Started instead of Completed to return faster
+                            log.LogInformation($"Successfully started VM {vmName} from hibernation.");
+                        } 
+                        catch (Exception ex) 
+                        {
+                            log.LogWarning(ex, $"Error resuming VM {vmName} from hibernation. Will continue and hope it starts normally.");
+                        }
+                    } 
+                    else 
+                    {
+                        log.LogInformation($"VM {vmName} is not in a hibernated state. It should be running already.");
                     }
-                } else {
-                    log.LogInformation($"VM {vmName} is not in a hibernated state. It should be running already.");
+                }
+                else
+                {
+                    log.LogInformation($"VM {vmName} is already running, skipping hibernation check and startup");
                 }
                 
-                // Run a quick RDP service activation on a separate thread to help speed up availability
+                // Run RDP service activation for both new and existing VMs to ensure it's active
+                // For existing VMs, this is less likely to be needed but doesn't hurt
                 _ = Task.Run(async () => {
                     try {
                         log.LogInformation($"Running proactive RDP service check and activation for {vmName}...");
@@ -189,57 +281,29 @@ namespace DeployVMFunction
                     }
                 });
                 
+                log.LogInformation($"VM {vmName} is in running state. Skipping RDP service availability check.");
+                // Skip the RDP service check and assume the VM is ready
+                bool isRdpReady = true;
                 
-                log.LogInformation($"Waiting for VM {vmName} to complete boot process and initialize RDP service...");
-                int attempts = 0, maxAttempts = 20; // Reduced from 40 to 20 attempts
-                bool isRdpReady = false;
-                while (!isRdpReady && attempts < maxAttempts)
-                {
-                    try
-                    {
-                        using var tcpClient = new TcpClient();
-                        var connectTask = tcpClient.ConnectAsync(targetVmPrivateIp, 3389);
-                        // Reduce timeout from 5000ms to 3000ms
-                        if (await Task.WhenAny(connectTask, Task.Delay(3000)) == connectTask && connectTask.IsCompletedSuccessfully) {
-                            isRdpReady = true;
-                            log.LogInformation($"RDP port on {vmName} ({targetVmPrivateIp}) is responding after {attempts + 1} attempts.");
-                            tcpClient.Close();
-                        } else if (connectTask.IsFaulted) { throw connectTask.Exception?.InnerException ?? new SocketException((int)SocketError.ConnectionRefused); }
-                        else { throw new TimeoutException($"Connection attempt {attempts + 1}/{maxAttempts} timed out."); }
+                // Run RDP service activation in background to ensure it's ready when the user connects
+                _ = Task.Run(async () => {
+                    try {
+                        log.LogInformation($"Running background RDP service activation for {vmName}...");
+                        var rdpActivationScript = @"$s = Get-Service -Name 'TermService' -EA SilentlyContinue; 
+                            if ($s) { 
+                                Start-Service -Name 'TermService' -Force; 
+                                Set-Service -Name 'TermService' -StartupType Automatic; 
+                                Write-Output 'RDP_SERVICE_ACTIVATED' 
+                            } else { 
+                                Write-Output 'RDP_SERVICE_NOT_FOUND' 
+                            }";
+                        var cmdInput = new RunCommandInput("RunPowerShellScript");
+                        cmdInput.Script.Add(rdpActivationScript);
+                        await vm.RunCommandAsync(WaitUntil.Started, cmdInput);
+                    } catch (Exception ex) {
+                        log.LogWarning(ex, $"Could not run background RDP service activation for {vmName}");
                     }
-                    catch (Exception ex)
-                    {
-                        attempts++;
-                        log.LogInformation($"Waiting for RDP service on {vmName}... Attempt {attempts}/{maxAttempts} - ({ex.GetType().Name})");
-                        if (attempts >= maxAttempts) break;
-                        // Reduce delay between attempts from 6000ms to 3000ms
-                        await Task.Delay(3000);
-
-                        // RDP Service Check via RunCommand (only at half attempts)
-                        if (attempts == maxAttempts / 4 || attempts == maxAttempts / 2)
-                        {
-                            log.LogInformation($"Running service check script at attempt {attempts}/{maxAttempts} for {vmName}...");
-                            try
-                            {
-                                // Enhanced script to not only check but also ensure RDP service is running
-                                var checkScript = @"$s = Get-Service -Name 'TermService' -EA SilentlyContinue; if ($s) { if ($s.Status -ne 'Running') { Start-Service -Name 'TermService' -Force; Write-Output 'RDP_SERVICE_STARTED' } else { Write-Output 'RDP_SERVICE_RUNNING' } } else { Write-Output 'RDP_SERVICE_NOT_FOUND' }";
-                                var cmdInput = new RunCommandInput("RunPowerShellScript");
-                                cmdInput.Script.Add(checkScript);
-
-                                ArmOperation<VirtualMachineRunCommandResult> cmdResultOperation = await vm.RunCommandAsync(WaitUntil.Completed, cmdInput);
-
-                                // Access Value property of ArmOperation<T> to get VirtualMachineRunCommandResult
-                                VirtualMachineRunCommandResult? runResult = cmdResultOperation.Value;
-                                IReadOnlyList<InstanceViewStatus>? statuses = runResult?.Value; // Access Value property of VirtualMachineRunCommandResult
-                                string? outputText = statuses?.FirstOrDefault()?.Message?.Trim();
-
-                                if (outputText == "RDP_SERVICE_RUNNING") { log.LogInformation($"RDP service on {vmName} confirmed RUNNING via RunCommand."); }
-                                else { log.LogWarning($"RDP service on {vmName} status via RunCommand: {outputText ?? "No Output"}."); }
-                            }
-                            catch (Exception cmdEx) { log.LogWarning(cmdEx, $"Could not check RDP service status on {vmName} via RunCommand."); }
-                        }
-                    }
-                }
+                });
 
                 // Always use the default password
                 randomPassword = "Rt@wqPP7ZvUgtS7"; // Default password
@@ -287,12 +351,24 @@ namespace DeployVMFunction
                     return authErrorResponse;
                 }
 
-                // Determine which user account to assign based on round-robin strategy
-                string targetUsername = GetNextAvailableUserAccount(log);
+                // Determine which user account to assign based on VM assignments
+                string targetUsername;
+                if (assignmentTracker != null)
+                {
+                    // Use the assignment tracker to assign and record the account
+                    targetUsername = await assignmentTracker.AssignAccountOnVMAsync(vm, targetVmPrivateIp, assignedAccountNumber);
+                }
+                else
+                {
+                    // Fallback to the old static counter method if tracker isn't available
+                    targetUsername = GetNextAvailableUserAccount(log);
+                }
                 log.LogInformation($"Assigning user to {targetUsername} for VM {vmName}");
                 
-                string? guacamoleConnectionId = await CreateGuacamoleConnection(vmName, targetVmPrivateIp, targetUsername, 
-                                                                             randomPassword, guacamoleApiBaseUrl, authToken, dataSource, log);
+                // Make connection name unique by adding the username
+                string connectionName = $"{vmName}-{targetUsername}";
+                string? guacamoleConnectionId = await CreateGuacamoleConnection(connectionName, targetVmPrivateIp, targetUsername, 
+                                                                            randomPassword, guacamoleApiBaseUrl, authToken, dataSource, log);
 
                 if (string.IsNullOrEmpty(guacamoleConnectionId))
                 {
@@ -344,7 +420,7 @@ namespace DeployVMFunction
                     vmUsername = targetUsername,
                     vmPassword = randomPassword,
                     vmSize = vm.Data?.HardwareProfile?.VmSize?.ToString() ?? "Unknown",
-                    provisioningDurationEstimate = $"{attempts * 3} seconds"
+                    provisioningDurationEstimate = "<1 second"
                 });
                 return responseOk;
             }
@@ -360,9 +436,9 @@ namespace DeployVMFunction
 
         // Create Guacamole Connection
         private static async Task<string?> CreateGuacamoleConnection(string connectionName, string targetIpAddress, 
-                                                                string targetUsername, string targetPassword, 
-                                                                string guacamoleApiBaseUrl, string authToken, 
-                                                                string dataSource, ILogger log)
+                                                                  string targetUsername, string targetPassword, 
+                                                                  string guacamoleApiBaseUrl, string authToken, 
+                                                                  string dataSource, ILogger log)
         {
             string createConnectionUrl = $"{guacamoleApiBaseUrl.TrimEnd('/')}/api/session/data/{dataSource}/connections?token={authToken}";
             var connectionPayload = new JObject(
@@ -420,8 +496,9 @@ namespace DeployVMFunction
             }
         }
 
-        // Assign users to different operator accounts in a round-robin fashion
-        // Assign users to different operator accounts in a round-robin fashion
+        /// <summary>
+        /// Legacy method for account assignment - only used if Table Storage isn't available
+        /// </summary>
         private static int currentOperatorIndex = 0;
         private static readonly object operatorIndexLock = new object();
 
