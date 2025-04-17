@@ -1,5 +1,5 @@
 # validate_hibernation.ps1
-# Script to validate that application state was preserved across hibernation
+# Script to validate that ShopFloorEditor was preserved across hibernation
 
 # Script execution logging
 $scriptLogPath = "C:\ProgramData\SolidCAM\script_execution_log.txt"
@@ -18,20 +18,19 @@ $startTime = Get-Date
 Add-Content -Path $scriptLogPath -Value "Script execution: $startTime - validate_hibernation.ps1 starting"
 Write-Output "=== SCRIPT-ID: validate_hibernation.ps1 starting execution at $startTime ==="
 
-# Script to validate that application state was preserved across hibernation
-
-Write-Output "=== Validating VM hibernation state restoration ==="
+Write-Output "=== Validating ShopFloorEditor state after hibernation ==="
 Write-Output "Date/Time: $(Get-Date)"
 
-# 1. Check if we've resumed from hibernation
-Write-Output "1) Checking if VM resumed from hibernation..."
+# 1. Get system boot information
 $lastBootUpTime = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime
 $currentTime = Get-Date
 $uptime = $currentTime - $lastBootUpTime
 
-Write-Output "   Current system uptime: $($uptime.Hours) hours, $($uptime.Minutes) minutes, $($uptime.Seconds) seconds"
+Write-Output "1) System information:"
+Write-Output "   Last boot time: $lastBootUpTime"
+Write-Output "   Current uptime: $($uptime.Hours) hours, $($uptime.Minutes) minutes, $($uptime.Seconds) seconds"
 
-# Get power transition events from the event log
+# 2. Check for hibernation resume events
 $hibernateEvents = Get-WinEvent -FilterHashtable @{
     LogName = 'System'
     Id = 1, 42 # 1 = system startup, 42 = system resume from hibernate
@@ -47,14 +46,14 @@ foreach ($event in $hibernateEvents) {
 }
 
 if ($resumedFromHibernate) {
-    Write-Output "   VM has resumed from hibernation!"
+    Write-Output "   CONFIRMED: VM has resumed from hibernation!"
 } else {
     Write-Output "   No evidence found that the VM resumed from hibernation."
     Write-Output "   This might be a normal startup or the events might have been cleared."
 }
 
-# 2. Check if ShopFloorEditor is running
-Write-Output "2) Checking if ShopFloorEditor maintained its state..."
+# 3. Check if ShopFloorEditor is running
+Write-Output "2) Checking ShopFloorEditor process..."
 $shopFloorProcess = Get-Process -Name "ShopFloorEditor" -ErrorAction SilentlyContinue
 
 if ($shopFloorProcess) {
@@ -65,7 +64,22 @@ if ($shopFloorProcess) {
     $processUptime = $currentTime - $shopFloorProcess.StartTime
     Write-Output "   Process running for: $($processUptime.Hours) hours, $($processUptime.Minutes) minutes, $($processUptime.Seconds) seconds"
     
-    # Compare with system uptime
+    # Check which user is running the process
+    try {
+        $processOwner = (Get-WmiObject -Query "Select * From Win32_Process Where ProcessId = $($shopFloorProcess.Id)").GetOwner()
+        Write-Output "   Process is running under user: $($processOwner.Domain)\$($processOwner.User)"
+        
+        # Check if it's running as SolidCAMOperator1
+        if ($processOwner.User -eq "SolidCAMOperator1") {
+            Write-Output "   CONFIRMED: Process is running as SolidCAMOperator1 as expected"
+        } else {
+            Write-Output "   WARNING: Process is NOT running as SolidCAMOperator1"
+        }
+    } catch {
+        Write-Output "   Could not determine process owner: $_"
+    }
+    
+    # Compare with system uptime (key indicator of hibernation preservation)
     if ($processUptime.TotalSeconds -gt $uptime.TotalSeconds) {
         Write-Output "   CONFIRMED: Process start time predates system boot time!"
         Write-Output "   This is strong evidence that hibernation successfully preserved the application state."
@@ -74,26 +88,36 @@ if ($shopFloorProcess) {
         Write-Output "   This suggests the process may have been restarted rather than resumed from hibernation."
     }
 } else {
-    Write-Output "   WARNING: ShopFloorEditor is not running!"
-    Write-Output "   This may indicate hibernation did not preserve the application state."
+    Write-Output "   CRITICAL ERROR: ShopFloorEditor is not running!"
+    Write-Output "   This indicates hibernation did not preserve the application state."
     
-    # Check if it's in the list of running processes with a different name
-    Write-Output "   Checking for processes that might be ShopFloorEditor under a different name..."
+    # Check if any SolidCAM processes are running
+    Write-Output "   Checking for any SolidCAM processes..."
     $processes = Get-Process | Where-Object { 
         $_.Path -like "*SolidCAM*" -or $_.Path -like "*ShopFloor*" 
     } | Select-Object Name, Id, Path, StartTime
     
     if ($processes.Count -gt 0) {
-        Write-Output "   Found possible related processes:"
+        Write-Output "   Found related processes:"
         foreach ($proc in $processes) {
             Write-Output "     - $($proc.Name) (PID: $($proc.Id), Path: $($proc.Path), Started: $($proc.StartTime))"
         }
     } else {
         Write-Output "   No related processes found."
     }
+    
+    # Check if SolidCAMOperator1 is logged in
+    $operatorLoggedIn = query session SolidCAMOperator1 2>$null
+    $operatorLoggedIn = ($LASTEXITCODE -eq 0)
+    
+    if ($operatorLoggedIn) {
+        Write-Output "   NOTE: SolidCAMOperator1 is currently logged in, but ShopFloorEditor is not running."
+    } else {
+        Write-Output "   NOTE: SolidCAMOperator1 is NOT currently logged in. Process may only run when user is logged in."
+    }
 }
 
-# 3. Log the validation results for future reference
+# 4. Create a comprehensive log entry
 $logPath = "C:\ProgramData\SolidCAM\hibernation_validation_log.txt"
 $logDir = Split-Path -Parent $logPath
 
@@ -120,11 +144,17 @@ ShopFloorEditor Start Time: $($shopFloorProcess.StartTime)
 Process Uptime: $($processUptime.Hours) hours, $($processUptime.Minutes) minutes, $($processUptime.Seconds) seconds
 State Preserved: $($processUptime.TotalSeconds -gt $uptime.TotalSeconds)
 "@
+    
+    if ($processOwner) {
+        $logContent += @"
+Process Owner: $($processOwner.Domain)\$($processOwner.User)
+Running as SolidCAMOperator1: $($processOwner.User -eq "SolidCAMOperator1")
+"@
+    }
 }
 
 Add-Content -Path $logPath -Value $logContent
 
-Write-Output "3) Validation results logged to: $logPath"
 Write-Output "3) Validation results logged to: $logPath"
 Write-Output "=== Hibernation validation completed ==="
 
@@ -135,4 +165,8 @@ Write-Output "=== SCRIPT-ID: validate_hibernation.ps1 completed execution at $en
 
 # Create a proof file for this execution
 Set-Content -Path "$proofPath\validate_hibernation_ran_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt" -Value "Script executed from $startTime to $endTime
-Hibernation validation results: Resumed From Hibernation: $resumedFromHibernate, ShopFloorEditor Running: $($null -ne $shopFloorProcess)"
+Hibernation validation results: 
+- Resumed From Hibernation: $resumedFromHibernate
+- ShopFloorEditor Running: $($null -ne $shopFloorProcess)
+- Process preserved through hibernation: $($null -ne $shopFloorProcess -and $processUptime.TotalSeconds -gt $uptime.TotalSeconds)
+- Running as SolidCAMOperator1: $($null -ne $processOwner -and $processOwner.User -eq 'SolidCAMOperator1')"

@@ -107,46 +107,60 @@ namespace DeployVMFunction
             _logger.LogInformation($"VMPoolManager initialized. Target RG: {_resourceGroup.Id}, Location: {_location}, Pool Size: {_minPoolSize}");
         }
 
-private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
-{
-    _logger.LogInformation($"Running persistent optimization for VM {vm.Data.Name}…");
-
-    // 1) Find the script file (copied to output)
-    var scriptPath = Path.Combine(Environment.CurrentDirectory, "optimization.ps1");
-    if (!File.Exists(scriptPath))
-        throw new FileNotFoundException($"Cannot find {scriptPath}");
-
-    // 2) Read all lines
-    var scriptLines = File.ReadAllLines(scriptPath);
-
-    // 3) Build the RunCommand input
-    var runCommandInput = new RunCommandInput("RunPowerShellScript");
-    foreach (var line in scriptLines)
-    {
-        runCommandInput.Script.Add(line);
-    }
-
-    // 4) Execute it
-    try
-    {
-        var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
-        _logger.LogInformation($"Persistent optimization completed for VM {vm.Data.Name}");
-        if (result?.Value?.Value != null)
+        /// <summary>
+        /// Launch ShopFloorEditor for SolidCAMOperator1 and hibernate the VM
+        /// </summary>
+        private async Task LaunchShopFloorAndHibernateAsync(VirtualMachineResource vm)
         {
-            foreach (var outp in result.Value.Value)
-                if (outp.Message?.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0)
-                    _logger.LogWarning($"Optimization warning: {outp.Message}");
+            try
+            {
+                _logger.LogInformation($"Starting ShopFloorEditor for VM {vm.Data.Name}...");
+
+                // Execute run_shopfloor.ps1 script
+                var scriptPath = Path.Combine(Environment.CurrentDirectory, "run_shopfloor.ps1");
+                if (!File.Exists(scriptPath))
+                    throw new FileNotFoundException($"Cannot find {scriptPath}");
+
+                // Read all lines from the script
+                var scriptLines = File.ReadAllLines(scriptPath);
+
+                // Build the RunCommand input
+                var runCommandInput = new RunCommandInput("RunPowerShellScript");
+                foreach (var line in scriptLines)
+                {
+                    runCommandInput.Script.Add(line);
+                }
+
+                // Execute it
+                var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                _logger.LogInformation($"ShopFloorEditor setup completed for VM {vm.Data.Name}");
+                
+                // Log any output from the script
+                if (result?.Value?.Value != null)
+                {
+                    foreach (var outp in result.Value.Value)
+                    {
+                        _logger.LogInformation($"Script output: {outp.Message}");
+                        if (outp.Message?.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0)
+                            _logger.LogWarning($"Script warning: {outp.Message}");
+                    }
+                }
+
+                // Wait a bit more to ensure everything is stable
+                _logger.LogInformation($"Giving ShopFloorEditor additional time to stabilize...");
+                await Task.Delay(TimeSpan.FromSeconds(30));
+
+                // Now hibernate the VM
+                _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
+                await HibernateVMAsync(vm);
+                _logger.LogInformation($"VM {vm.Data.Name} successfully hibernated");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"Error in LaunchShopFloorAndHibernateAsync for VM {vm.Data.Name}");
+                throw;
+            }
         }
-    }
-    catch (Exception ex)
-    {
-        _logger.LogWarning(ex, $"Optimization encountered issues for VM {vm.Data.Name}, continuing deallocation.");
-    }
-}
-
-
-
-
 
         /// <summary>
         /// Get current status of the VM pool (VMs named SolidCAM-VM-Pool-*)
@@ -387,19 +401,18 @@ private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
             }
         }
 
-         /// <summary>
-        /// Creates a new VM (NSG, NIC, VM) with configured password and then deallocates it.
+        /// <summary>
+        /// Creates a new VM with hibernation enabled, starts ShopFloorEditor, and then hibernates it.
         /// Intended for adding VMs to the pool.
         /// </summary>
         public async Task<VirtualMachineResource> CreatePoolVMAsync()
         {
             var timestamp = DateTime.UtcNow.ToString("yyyyMMddHHmmssfff");
-            // Using "Pool" in the name to clearly identify these resources
             var vmName = $"SolidCAM-VM-Pool-{timestamp}";
             var nicName = $"vm-nic-pool-{timestamp}";
             var nsgName = $"vm-nsg-pool-{timestamp}";
 
-            _logger.LogInformation($"Creating new pool VM with configured password: {vmName}");
+            _logger.LogInformation($"Creating new pool VM: {vmName}");
 
             // For cleanup in case of failure
             NetworkSecurityGroupResource? nsg = null;
@@ -422,53 +435,45 @@ private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
                             VirtualNetworkResource existingVnet = await _resourceGroup.GetVirtualNetworks().GetAsync(_vnetName);
                             SubnetResource subnet = await existingVnet.GetSubnets().GetAsync(_subnetName);
 
-                            // Reuse existing NSG and NIC if they were created in previous attempts
-                            if (nsg == null)
+                            // Create NSG
+                            _logger.LogInformation($"Creating NSG for pool VM {vmName}: {nsgName}");
+                            var nsgData = new NetworkSecurityGroupData()
                             {
-                                // Create NSG
-                                _logger.LogInformation($"Creating NSG for pool VM {vmName}: {nsgName}");
-                                var nsgData = new NetworkSecurityGroupData()
+                                Location = locationOption,
+                                SecurityRules =
                                 {
-                                    Location = locationOption,
-                                    SecurityRules =
+                                    new SecurityRuleData()
                                     {
-                                        new SecurityRuleData()
-                                        {
-                                            Name = "AllowRDP_From_Guacamole", Priority = 1000, Access = SecurityRuleAccess.Allow, Direction = SecurityRuleDirection.Inbound,
-                                            Protocol = SecurityRuleProtocol.Tcp, SourceAddressPrefix = _guacamoleServerPrivateIp, SourcePortRange = "*",
-                                            DestinationAddressPrefix = "*", DestinationPortRange = "3389"
-                                        }
+                                        Name = "AllowRDP_From_Guacamole", Priority = 1000, Access = SecurityRuleAccess.Allow, Direction = SecurityRuleDirection.Inbound,
+                                        Protocol = SecurityRuleProtocol.Tcp, SourceAddressPrefix = _guacamoleServerPrivateIp, SourcePortRange = "*",
+                                        DestinationAddressPrefix = "*", DestinationPortRange = "3389"
                                     }
-                                };
-                                var nsgCollection = _resourceGroup.GetNetworkSecurityGroups();
-                                var nsgCreateOp = await nsgCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, nsgName, nsgData);
-                                nsg = nsgCreateOp.Value;
-                                _logger.LogInformation($"NSG created: {nsg.Id}");
-                            }
+                                }
+                            };
+                            var nsgCollection = _resourceGroup.GetNetworkSecurityGroups();
+                            var nsgCreateOp = await nsgCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, nsgName, nsgData);
+                            nsg = nsgCreateOp.Value;
+                            _logger.LogInformation($"NSG created: {nsg.Id}");
 
-                            if (nic == null)
+                            // Create NIC
+                            _logger.LogInformation($"Creating network interface {nicName} in subnet {subnet.Id}");
+                            var nicData = new NetworkInterfaceData()
                             {
-                                // Create NIC
-                                _logger.LogInformation($"Creating network interface {nicName} in subnet {subnet.Id}");
-                                var nicData = new NetworkInterfaceData()
-                                {
-                                    Location = locationOption,
-                                    NetworkSecurityGroup = new NetworkSecurityGroupData() { Id = nsg.Id },
-                                    IPConfigurations = { new NetworkInterfaceIPConfigurationData() { Name = "ipconfig1", Primary = true, Subnet = new SubnetData() { Id = subnet.Id }, PrivateIPAllocationMethod = NetworkIPAllocationMethod.Dynamic } }
-                                };
-                                var nicCollection = _resourceGroup.GetNetworkInterfaces();
-                                var nicCreateOp = await nicCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, nicName, nicData);
-                                nic = nicCreateOp.Value;
-                                _logger.LogInformation($"NIC created: {nic.Id}");
-                            }
+                                Location = locationOption,
+                                NetworkSecurityGroup = new NetworkSecurityGroupData() { Id = nsg.Id },
+                                IPConfigurations = { new NetworkInterfaceIPConfigurationData() { Name = "ipconfig1", Primary = true, Subnet = new SubnetData() { Id = subnet.Id }, PrivateIPAllocationMethod = NetworkIPAllocationMethod.Dynamic } }
+                            };
+                            var nicCollection = _resourceGroup.GetNetworkInterfaces();
+                            var nicCreateOp = await nicCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, nicName, nicData);
+                            nic = nicCreateOp.Value;
+                            _logger.LogInformation($"NIC created: {nic.Id}");
 
                             // Create VM with current VM size option
-                            _logger.LogInformation($"Preparing VM configuration for pool VM {vmName} with size {vmSizeOption} in location {locationOption}...");
-                            var imageResourceId = new ResourceIdentifier(_galleryImageId);
-                            var vmData = new VirtualMachineData(locationOption) // Use current location option
+                            _logger.LogInformation($"Preparing VM configuration for pool VM {vmName}...");
+                            var vmData = new VirtualMachineData(locationOption)
                             {
-                                HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption }, // Use current size option
-                                // Add this line - Note the correct class name
+                                HardwareProfile = new VirtualMachineHardwareProfile() { VmSize = vmSizeOption },
+                                // Enable hibernation - this is critical
                                 AdditionalCapabilities = new Azure.ResourceManager.Compute.Models.AdditionalCapabilities 
                                 { 
                                     HibernationEnabled = true 
@@ -478,118 +483,69 @@ private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
                                 },
                                 StorageProfile = new VirtualMachineStorageProfile() {
                                     ImageReference = new ImageReference() { Id = new ResourceIdentifier(_galleryImageId) },
-                                    OSDisk = new VirtualMachineOSDisk(DiskCreateOptionType.FromImage) // Ensure OS disk is specified
+                                    OSDisk = new VirtualMachineOSDisk(DiskCreateOptionType.FromImage)
                                     {
-                                        // Optional: Specify disk size, type (e.g., Premium_LRS), caching
-                                        Caching = CachingType.ReadWrite, // Common default
+                                        Caching = CachingType.ReadWrite,
                                         ManagedDisk = new VirtualMachineManagedDisk()
                                         {
-                                            StorageAccountType = StorageAccountType.StandardLrs  // Or Standard_LRS, StandardSSD_LRS etc. based on image/requirements
+                                            StorageAccountType = StorageAccountType.StandardLrs
                                         }
                                     }
                                 },
-                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch }, // Assuming Trusted Launch is desired/compatible
-                                OSProfile = new VirtualMachineOSProfile() // Required even with gallery images in this version of the SDK
+                                SecurityProfile = new SecurityProfile() { SecurityType = SecurityType.TrustedLaunch },
+                                OSProfile = new VirtualMachineOSProfile()
                                 { 
-                                    ComputerName = vmName.Length > 15 ? vmName.Substring(0, 15) : vmName, // Windows VM names can't exceed 15 chars
-                                    AdminUsername = "localadmin", // Will be overridden by the gallery image, but required by the API
-                                    AdminPassword = Program.GenerateSecurePassword(16) // Will be overridden by the gallery image, but required by the API
+                                    ComputerName = vmName.Length > 15 ? vmName.Substring(0, 15) : vmName,
+                                    AdminUsername = "localadmin",
+                                    AdminPassword = Program.GenerateSecurePassword(16)
                                 }
                             };
-                            _logger.LogInformation($"Creating pool VM: {vmName} using image {_galleryImageId}");
+                            
+                            _logger.LogInformation($"Creating VM: {vmName}");
                             var vmCollection = _resourceGroup.GetVirtualMachines();
                             var vmCreateOp = await vmCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, vmName, vmData);
                             VirtualMachineResource vm = vmCreateOp.Value;
                             _logger.LogInformation($"VM creation completed for pool VM: {vm.Data.Name}");
 
-                            // Configure the user accounts while the VM is running (OPTIMIZATION)
-                            _logger.LogInformation($"Configuring user accounts for VM {vm.Data.Name} while running...");
-                            
-                            // Wait for a short time to ensure VM is fully running and services are up
-                            _logger.LogInformation($"Allowing brief initialization time for VM {vm.Data.Name}...");
+                            // Configure the user accounts while the VM is running
+                            _logger.LogInformation($"Configuring user accounts for VM {vm.Data.Name}...");
                             await Task.Delay(TimeSpan.FromSeconds(30));
                             
-                            // Always use the default password instead of generating a random one
                             string password = "Rt@wqPP7ZvUgtS7"; // Default password
                             bool configSuccess = await Program.ConfigureMultiUserAccountsAsync(vm, password, _logger);
                             
                             if (configSuccess)
                             {
-                                _logger.LogInformation($"Successfully configured user accounts with default password for VM {vm.Data.Name}");
+                                _logger.LogInformation($"Successfully configured user accounts for VM {vm.Data.Name}");
                             }
                             else
                             {
-                                _logger.LogWarning($"Failed to configure user accounts for VM {vm.Data.Name}. VM will still be added to pool.");
+                                _logger.LogWarning($"Failed to configure user accounts for VM {vm.Data.Name}");
                             }
-                            _logger.LogInformation($"Running persistent optimization before hibernating pool VM: {vmName}");
-                            await OptimizeVMForFasterStartupAsync(vm);
 
-                            // Now hibernate the VM instead of deallocating
-                            _logger.LogInformation($"Hibernating pool VM: {vmName}");
-                            await HibernateVMAsync(vm);
-                            _logger.LogInformation($"Pool VM hibernated: {vmName} and ready for use");
-
-                            // Update the default VM size and location if a fallback worked
-                            if (!vmSizeOption.ToString().Equals(_vmSize.ToString(), StringComparison.OrdinalIgnoreCase))
-                            {
-                                _logger.LogInformation($"Setting new default VM size to {vmSizeOption} for future creates");
-                                _vmSize = vmSizeOption;
-                            }
+                            // Launch ShopFloorEditor and hibernate VM
+                            _logger.LogInformation($"Launching ShopFloorEditor and hibernating VM: {vm.Data.Name}");
+                            await LaunchShopFloorAndHibernateAsync(vm);
                             
-                            if (!locationOption.Equals(_location))
-                            {
-                                _logger.LogInformation($"Setting new default location to {locationOption} for future creates");
-                                _location = locationOption;
-                            }
-
-                            return vm; // Return the hibernated VM resource
+                            return vm;
                         }
                         catch (RequestFailedException ex) when (ex.Status == 409 && ex.Message.Contains("quota"))
                         {
                             _logger.LogWarning($"Quota limit reached for VM size {vmSizeOption} in location {locationOption}. Error: {ex.Message}");
-                            
-                            // If this is the last VM size option for this location, continue to the next location
-                            if (vmSizeOption.ToString().Equals(_vmSizeFallbackOptions.Last().ToString(), StringComparison.OrdinalIgnoreCase))
-                            {
-                                _logger.LogWarning($"All VM size options exhausted for location {locationOption}. Moving to next location if available.");
-                                break; // Break out of VM size loop, continue to next location
-                            }
-                            
-                            // Otherwise continue to try the next size option
-                            _logger.LogInformation($"Trying next VM size option...");
-                            continue;
-                        }
-                        catch (RequestFailedException ex) when (ex.Status == 400 && ex.Message.Contains("Hypervisor Generation"))
-                        {
-                            _logger.LogWarning($"VM size {vmSizeOption} is not compatible with the Hypervisor Generation of the image. Error: {ex.Message}");
-                            
-                            // If this is the last VM size option for this location, continue to the next location
-                            if (vmSizeOption.ToString().Equals(_vmSizeFallbackOptions.Last().ToString(), StringComparison.OrdinalIgnoreCase))
-                            {
-                                _logger.LogWarning($"All VM size options exhausted for location {locationOption}. Moving to next location if available.");
-                                break; // Break out of VM size loop, continue to next location
-                            }
-                            
-                            // Otherwise continue to try the next size option
-                            _logger.LogInformation($"Trying next VM size option...");
                             continue;
                         }
                         catch (Exception ex)
                         {
                             _logger.LogError(ex, $"Error creating pool VM {vmName} with size {vmSizeOption} in location {locationOption}");
-                            
-                            // If this is a non-recoverable error, try the next location
-                            _logger.LogWarning($"Non-recoverable error for location {locationOption}. Moving to next location if available.");
-                            break; // Break out of VM size loop, continue to next location
+                            continue;
                         }
                     }
-                    // Continue to next location if we get here (all VM sizes exhausted for this location)
                 }
                 
-                // If we've exhausted all locations and VM sizes, clean up and throw
-                _logger.LogError("All VM size and location options exhausted due to quota limitations or compatibility issues. Please request a quota increase or check VM size compatibility.");
+                // If we've exhausted all options
+                _logger.LogError("All VM size and location options exhausted. Failed to create VM.");
                 await CleanupResources(nsg, nic);
-                throw new InvalidOperationException("Failed to create VM with all available size and location options");
+                throw new InvalidOperationException("Failed to create VM with all available options");
             }
             catch (Exception ex)
             {
@@ -842,6 +798,8 @@ private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
                 throw new InvalidOperationException("No VMs available in the pool. New VMs will NOT be created automatically.");
             }
         }
+
+        /// <summary>
         /// Hibernates a VM instead of deallocating it
         /// </summary>
         private async Task HibernateVMAsync(VirtualMachineResource vm)
@@ -863,9 +821,6 @@ private async Task OptimizeVMForFasterStartupAsync(VirtualMachineResource vm)
             }
         }
     }
-
-    
-    
 
     /// <summary>
     /// Represents the status of the VM pool.
