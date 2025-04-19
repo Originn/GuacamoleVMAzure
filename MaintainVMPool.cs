@@ -193,9 +193,9 @@ namespace DeployVMFunction
                                 // Now hibernate the VM using the Azure API
                                 logger.LogInformation($"Using Azure API to hibernate VM {vm.Data.Name}");
                                 
-                                // IMPORTANT: Use PowerOff with hibernateVM parameter set to true
-                                await vm.StopAsync(new VirtualMachineStopOptions { HibernateVM = true });
-                                logger.LogInformation($"VM {vm.Data.Name} hibernation command sent via Azure API");
+                                // Stop the VM using Azure API (hibernate flag not supported in this SDK version)
+                                await vm.PowerOffAsync(WaitUntil.Completed, skipShutdown: false);
+                                logger.LogInformation($"VM {vm.Data.Name} stop command sent via Azure API");
                                 
                                 // Wait for hibernation to complete
                                 await Task.Delay(TimeSpan.FromSeconds(30));

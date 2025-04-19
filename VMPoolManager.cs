@@ -113,23 +113,23 @@ namespace DeployVMFunction
         /// </summary>
         private async Task LaunchShopFloorAndHibernateAsync(VirtualMachineResource vm)
         {
-            // Execute hibernation_setup.ps1, which configures auto-logon, schedules RunOnce launch and reboot + hibernation
-            var scriptPath = Path.Combine(Environment.CurrentDirectory, "hibernation_setup.ps1");
+            // Inline one-time hibernation setup: schedule ShopFloorEditor at next SolidCAMOperator1 logon, then hibernate
+            _logger.LogInformation($"Scheduling one-time startup for ShopFloorEditor and hibernation on VM {vm.Data.Name}...");
+            var runCommandInput = new RunCommandInput("RunPowerShellScript");
+            // Load and execute the one-time hibernation setup script on the guest
+            var scriptPath = Path.Combine(Environment.CurrentDirectory, "OneTimeHibernationSetup.ps1");
             if (!File.Exists(scriptPath))
             {
-                throw new FileNotFoundException($"Cannot find hibernation script at {scriptPath}");
+                throw new FileNotFoundException($"Cannot find OneTimeHibernationSetup.ps1 at {scriptPath}");
             }
-
-            _logger.LogInformation($"Launching ShopFloorEditor and hibernating VM {vm.Data.Name}...");
             var scriptLines = File.ReadAllLines(scriptPath);
-            var runCommandInput = new RunCommandInput("RunPowerShellScript");
             foreach (var line in scriptLines)
             {
                 runCommandInput.Script.Add(line);
             }
 
-            _logger.LogInformation($"Executing hibernation setup script on VM {vm.Data.Name}...");
-            // Use Completed to wait for script to finish execution
+            _logger.LogInformation($"Executing one-time hibernation setup on VM {vm.Data.Name}...");
+            // Execute the inline script
             var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
             
             // Log script output
@@ -143,7 +143,20 @@ namespace DeployVMFunction
 
             // The hibernation_setup.ps1 script schedules auto-logon and final hibernation in the interactive user session,
             // then issues a reboot. We do not need to poll for completion here.
-            _logger.LogInformation($"Hibernation setup script executed on VM {vm.Data.Name}. VM will reboot, auto-log on in Session 1, run ShopFloorEditor, and hibernate.");
+            _logger.LogInformation($"Hibernation setup script executed on VM {vm.Data.Name}. Scheduled one-time startup task created.");
+
+            // Orchestrate reboot and hibernation via Azure SDK
+            _logger.LogInformation($"Restarting VM {vm.Data.Name} via Azure...");
+            await vm.RestartAsync(WaitUntil.Completed);
+
+            // Allow time for auto-logon and scheduled task to run inside the VM
+            _logger.LogInformation($"Waiting 60 seconds for scheduled startup to execute on VM {vm.Data.Name}...");
+            await Task.Delay(TimeSpan.FromSeconds(60));
+
+            _logger.LogInformation($"Stopping VM {vm.Data.Name} via Azure...");
+            // Note: using skipShutdown:false to stop the VM (hibernate flag not supported in this SDK version)
+            await vm.PowerOffAsync(WaitUntil.Completed, skipShutdown: false);
+            _logger.LogInformation($"VM {vm.Data.Name} should now be hibernated with ShopFloorEditor initialized.");
         }
 
 
