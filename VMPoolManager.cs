@@ -211,6 +211,38 @@ namespace DeployVMFunction
         }
 
         /// <summary>
+        /// Quick launch ShopFloorEditor via RunCommand and hibernate VM via Azure-side deallocate.
+        /// </summary>
+        private async Task QuickLaunchAndHibernateAsync(VirtualMachineResource vm)
+        {
+            _logger.LogInformation($"Starting ShopFloorEditor on VM {vm.Data.Name} via RunCommand");
+            var runCommand = new RunCommandInput("RunPowerShellScript");
+            runCommand.Script.Add("Start-Process -FilePath \"C:\\Program Files\\SolidCAM2024 Maker\\solidcam\\ShopFloorEditor.exe\"");
+            var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommand);
+            if (result?.Value?.Value != null)
+            {
+                foreach (var output in result.Value.Value)
+                {
+                    _logger.LogInformation($"RunCommand output: {output.Message}");
+                }
+            }
+            // Give the process time to start
+            await Task.Delay(TimeSpan.FromSeconds(15));
+            _logger.LogInformation($"Attempting Azure-side hibernation for VM {vm.Data.Name}");
+            try
+            {
+                await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
+                _logger.LogInformation($"VM {vm.Data.Name} successfully hibernated via deallocation.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, $"Failed to deallocate VM {vm.Data.Name} with hibernation; falling back to normal deallocation.");
+                await vm.DeallocateAsync(WaitUntil.Completed);
+                _logger.LogInformation($"VM {vm.Data.Name} deallocated normally.");
+            }
+        }
+
+        /// <summary>
         /// Get current status of the VM pool (VMs named SolidCAM-VM-Pool-*)
         /// </summary>
         public async Task<VMPoolStatus> GetPoolStatusAsync()
@@ -571,9 +603,8 @@ namespace DeployVMFunction
                                 _logger.LogWarning($"Failed to configure user accounts for VM {vm.Data.Name}");
                             }
 
-                            // Launch ShopFloorEditor and hibernate VM
-                            _logger.LogInformation($"Launching ShopFloorEditor and hibernating VM: {vm.Data.Name}");
-                            await LaunchShopFloorAndHibernateAsync(vm);
+                            // Launch ShopFloorEditor and hibernate VM via Azure-side deallocation
+                            await QuickLaunchAndHibernateAsync(vm);
                             
                             return vm;
                         }
