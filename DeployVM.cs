@@ -390,9 +390,9 @@ namespace DeployVMFunction
                             log.LogInformation($"VM {vmName} will be hibernated in 60 seconds...");
                             await Task.Delay(TimeSpan.FromSeconds(60));
                             log.LogInformation($"Starting hibernation of VM {vmName}...");
-                            // Use PowerOff with hibernate=true to hibernate the VM
-                            await vm.PowerOffAsync(WaitUntil.Completed, skipShutdown: true);
-                            log.LogInformation($"Successfully hibernated VM {vmName}");
+                            // Use proper Azure API for hibernation
+                            await vm.StopAsync(new VirtualMachineStopOptions { HibernateVM = true });
+                            log.LogInformation($"Successfully sent hibernation command to VM {vmName} via Azure API");
                         }
                         catch (Exception ex) {
                             log.LogError(ex, $"Failed to hibernate VM {vmName}: {ex.Message}");

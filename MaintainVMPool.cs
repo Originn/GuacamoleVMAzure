@@ -165,34 +165,40 @@ namespace DeployVMFunction
                             logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
                             try
                             {
-                                // Method 1: Try to use the built-in hibernate parameter on PowerOff
-                                var parameters = new Dictionary<string, string>();
-                                parameters.Add("skipShutdown", "true");
-                                parameters.Add("hibernate", "true");
+                                // First run the hibernation_setup.ps1 script to prepare the VM
+                                logger.LogInformation($"Running hibernation setup script on VM {vm.Data.Name}...");
+                                var setupScript = new RunCommandInput("RunPowerShellScript");
+                                setupScript.Script.Add(@"
+                                    # Run the hibernation_setup.ps1 script
+                                    & 'C:\ProgramData\SolidCAM\hibernation_setup.ps1'
+                                    
+                                    # Wait for ShopFloorEditor to start
+                                    Start-Sleep -Seconds 60
+                                    
+                                    # Verify ShopFloorEditor is running
+                                    $process = Get-Process -Name 'ShopFloorEditor' -ErrorAction SilentlyContinue
+                                    if ($process) {
+                                        Write-Output 'ShopFloorEditor is running, ready for hibernation'
+                                    } else {
+                                        Write-Output 'WARNING: ShopFloorEditor is not running'
+                                    }
+                                ");
                                 
-                                    try {
-                                    // Try to hibernate using the PowerOff method with hibernate parameter
-                                    await vm.PowerOffAsync(WaitUntil.Completed, skipShutdown: true);
-                                    logger.LogInformation($"VM {vm.Data.Name} hibernated and returned to pool");
-                                    return; // Exit the method since we're done
-                                }
-                                catch (Exception innerEx) {
-                                }
+                                var scriptResult = await vm.RunCommandAsync(WaitUntil.Completed, setupScript);
+                                logger.LogInformation($"Hibernation setup script completed on VM {vm.Data.Name}");
                                 
-                                // Method 2: Use PowerState runCommand as fallback
-                                string hibernateScript = @"
-                                    $state = Stop-Computer -Force -PassThru -Hibernate
-                                    Write-Output ""Hibernate command returned: $state""
-                                ";
-                                
-                                var runCommandInput = new RunCommandInput("RunPowerShellScript");
-                                runCommandInput.Script.Add(hibernateScript);
-                                
-                                await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
-                                logger.LogInformation($"Successfully sent hibernation command to VM {vm.Data.Name}");
-                                
-                                // Wait a bit for the hibernation to take effect
+                                // Wait for the VM setup to complete (60 seconds)
                                 await Task.Delay(TimeSpan.FromSeconds(10));
+                                
+                                // Now hibernate the VM using the Azure API
+                                logger.LogInformation($"Using Azure API to hibernate VM {vm.Data.Name}");
+                                
+                                // IMPORTANT: Use PowerOff with hibernateVM parameter set to true
+                                await vm.StopAsync(new VirtualMachineStopOptions { HibernateVM = true });
+                                logger.LogInformation($"VM {vm.Data.Name} hibernation command sent via Azure API");
+                                
+                                // Wait for hibernation to complete
+                                await Task.Delay(TimeSpan.FromSeconds(30));
                                 logger.LogInformation($"VM {vm.Data.Name} hibernated and returned to pool");
                             }
                             catch (Exception hibEx)
