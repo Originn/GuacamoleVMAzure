@@ -108,7 +108,7 @@ namespace DeployVMFunction
         }
 
         /// <summary>
-        /// Launch ShopFloorEditor for SolidCAMOperator1 and hibernate the VM
+        /// Launch ShopFloorEditor for SolidCAMOperator1 and hibernate the VM - without any image modifications
         /// </summary>
         private async Task LaunchShopFloorAndHibernateAsync(VirtualMachineResource vm)
         {
@@ -133,7 +133,7 @@ namespace DeployVMFunction
 
                 // Execute it
                 var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
-                _logger.LogInformation($"ShopFloorEditor setup completed for VM {vm.Data.Name}");
+                _logger.LogInformation($"ShopFloorEditor launch attempted on VM {vm.Data.Name}");
                 
                 // Log any output from the script
                 if (result?.Value?.Value != null)
@@ -141,19 +141,17 @@ namespace DeployVMFunction
                     foreach (var outp in result.Value.Value)
                     {
                         _logger.LogInformation($"Script output: {outp.Message}");
-                        if (outp.Message?.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0)
-                            _logger.LogWarning($"Script warning: {outp.Message}");
                     }
                 }
 
-                // Wait a bit more to ensure everything is stable
-                _logger.LogInformation($"Giving ShopFloorEditor additional time to stabilize...");
+                // Wait a bit more to ensure application is loaded
+                _logger.LogInformation($"Waiting for ShopFloorEditor to fully load...");
                 await Task.Delay(TimeSpan.FromSeconds(30));
 
                 // Now hibernate the VM
                 _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
-                await HibernateVMAsync(vm);
-                _logger.LogInformation($"VM {vm.Data.Name} successfully hibernated");
+                // Pass true to run the pre-hibernation executable
+                await HibernateVMAsync(vm, true);
             }
             catch (Exception ex)
             {
@@ -800,13 +798,100 @@ namespace DeployVMFunction
         }
 
         /// <summary>
-        /// Hibernates a VM instead of deallocating it
+        /// Hibernates a VM instead of deallocating it.
+        /// If runPreHibernationExe is true, executes a program before hibernation.
         /// </summary>
-        private async Task HibernateVMAsync(VirtualMachineResource vm)
+        private async Task HibernateVMAsync(VirtualMachineResource vm, bool runPreHibernationExe = false)
         {
             try
             {
                 _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
+                
+                // Run the pre-hibernation executable only if specified (regular hibernation, not reconnect)
+                if (runPreHibernationExe)
+                {
+                    try
+                    {
+                        _logger.LogInformation($"Running pre-hibernation executable for VM {vm.Data.Name}...");
+                        
+                        // Try to find the hibernation setup script in multiple locations
+                        string[] possibleScriptPaths = new string[]
+                        {
+                            Path.Combine(Environment.CurrentDirectory, "hibernation_setup.ps1"),
+                            "hibernation_setup.ps1",  // Try just the filename
+                            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "hibernation_setup.ps1") // Try base directory
+                        };
+                        
+                        string scriptPath = null;
+                        foreach (var path in possibleScriptPaths)
+                        {
+                            if (File.Exists(path))
+                            {
+                                scriptPath = path;
+                                _logger.LogInformation($"Found hibernation script at: {scriptPath}");
+                                break;
+                            }
+                        }
+                        
+                        if (scriptPath == null)
+                        {
+                            _logger.LogWarning("Cannot find hibernation_setup.ps1 in any of the checked locations");
+                            
+                            // Use a hardcoded simple hibernation script as fallback
+                            _logger.LogInformation("Using fallback hibernation script");
+                            var runCommandInput = new RunCommandInput("RunPowerShellScript");
+                            runCommandInput.Script.Add("Write-Output \"=== Running Built-in Hibernation Setup ===\"");
+                            runCommandInput.Script.Add("# Enable hibernation and set it to full");
+                            runCommandInput.Script.Add("powercfg /hibernate on");
+                            runCommandInput.Script.Add("powercfg /h /type full");
+                            runCommandInput.Script.Add("Write-Output \"Hibernation enabled and set to full\"");
+                            
+                            // Execute it
+                            var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                            _logger.LogInformation($"Fallback hibernation script executed on VM {vm.Data.Name}");
+                            
+                            // Log any output from the script
+                            if (result?.Value?.Value != null)
+                            {
+                                foreach (var outp in result.Value.Value)
+                                {
+                                    _logger.LogInformation($"Script output: {outp.Message}");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // Read all lines from the script
+                            var scriptLines = File.ReadAllLines(scriptPath);
+
+                            // Build the RunCommand input
+                            var runCommandInput = new RunCommandInput("RunPowerShellScript");
+                            foreach (var line in scriptLines)
+                            {
+                                runCommandInput.Script.Add(line);
+                            }
+
+                            // Execute it
+                            var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                            _logger.LogInformation($"Pre-hibernation script executed on VM {vm.Data.Name}");
+                            
+                            // Log any output from the script
+                            if (result?.Value?.Value != null)
+                            {
+                                foreach (var outp in result.Value.Value)
+                                {
+                                    _logger.LogInformation($"Script output: {outp.Message}");
+                                }
+                            }
+                        }
+                        
+                        _logger.LogInformation($"Successfully ran pre-hibernation executable for VM {vm.Data.Name}");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, $"Failed to run pre-hibernation executable for VM {vm.Data.Name}. Will continue with hibernation.");
+                    }
+                }
                 
                 // Use deallocate with hibernate=true instead of PowerOff
                 await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);

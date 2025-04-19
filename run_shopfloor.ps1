@@ -1,6 +1,6 @@
 # run_shopfloor.ps1
-# Simple script to launch ShopFloorEditor under SolidCAMOperator1 before hibernation
-# Also ensures the screen is unlocked and visible after hibernation
+# Script to launch ShopFloorEditor for SolidCAMOperator1
+# Modified to work with FSLogix profile management
 
 Write-Output "=== Starting ShopFloorEditor for SolidCAMOperator1 ==="
 
@@ -13,203 +13,242 @@ if (!(Test-Path $editorPath)) {
     exit 1
 }
 
-# Create scripts directory for post-resume scripts
-$scriptsDir = "C:\ProgramData\SolidCAM"
-if (!(Test-Path $scriptsDir)) {
-    New-Item -Path $scriptsDir -ItemType Directory -Force | Out-Null
+# Check if ShopFloorEditor is already running
+$shopFloorProcess = Get-Process -Name "ShopFloorEditor" -ErrorAction SilentlyContinue
+
+if ($shopFloorProcess) {
+    Write-Output "ShopFloorEditor is already running with PID: $($shopFloorProcess.Id)"
+    exit 0
 }
 
-# Create a script that will run after resume to ensure the screen is visible
-$postResumeScriptPath = "$scriptsDir\post_resume.ps1"
-$postResumeScript = @"
-# Script to run after VM resume to ensure screen is visible
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-
-public class DisplayState {
-    [DllImport("user32.dll")]
-    public static extern int ShowWindow(int hwnd, int command);
+# Create machine-level preparations for auto-startup (FSLogix profile aware)
+try {
+    Write-Output "Setting up auto-start mechanisms (compatible with FSLogix profiles)..."
     
-    [DllImport("kernel32.dll")]
-    public static extern IntPtr GetConsoleWindow();
-}
+    # Create required directories
+    $startupScriptsDir = "C:\ProgramData\SolidCAM\StartupScripts"
+    if (!(Test-Path $startupScriptsDir)) {
+        New-Item -Path $startupScriptsDir -ItemType Directory -Force | Out-Null
+    }
+    
+    # Create a Group Policy startup script that will run before FSLogix mounts profiles
+    $gpStartupScript = @"
+@echo off
+echo Running SolidCAM startup script at %date% %time% > C:\ProgramData\SolidCAM\startup_log.txt
+
+REM Set up auto-logon for SolidCAMOperator1
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d SolidCAMOperator1 /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d Rt@wqPP7ZvUgtS7 /f
+
+REM Create default startup programs for all users
+if not exist "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup" mkdir "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+echo Set oWS = WScript.CreateObject("WScript.Shell") > "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\StartShopFloorEditor.vbs"
+echo sLinkFile = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\ShopFloorEditor.lnk" >> "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\StartShopFloorEditor.vbs"
+echo Set oLink = oWS.CreateShortcut(sLinkFile) >> "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\StartShopFloorEditor.vbs"
+echo oLink.TargetPath = "$editorPath" >> "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\StartShopFloorEditor.vbs"
+echo oLink.Save >> "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\StartShopFloorEditor.vbs"
+cscript //nologo "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\StartShopFloorEditor.vbs"
+del "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\StartShopFloorEditor.vbs"
+
+echo Setup completed at %date% %time% >> C:\ProgramData\SolidCAM\startup_log.txt
 "@
+    
+    $gpStartupScriptPath = "$startupScriptsDir\StartupPrep.cmd"
+    Set-Content -Path $gpStartupScriptPath -Value $gpStartupScript -Force
+    
+    # Create task to run our script at system startup (before user login and FSLogix)
+    $taskName = "SolidCAM-SystemStartup"
+    
+    # Remove existing task if present
+    schtasks /query /tn $taskName 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        schtasks /delete /tn $taskName /f
+    }
+    
+    # Create task running as SYSTEM at startup
+    schtasks /create /tn $taskName /tr "$gpStartupScriptPath" /sc onstart /ru "SYSTEM" /f
+    
+    Write-Output "System startup task created successfully"
+    
+    # Create a startup verification script that runs with a delay
+    $verificationScript = @"
+@echo off
+echo Running delayed verification at %date% %time% > C:\ProgramData\SolidCAM\verification_log.txt
 
-# Keep session awake
-\$sleepPrevention = New-Object -TypeName System.Diagnostics.Process
-\$sleepPrevention.StartInfo.FileName = "powercfg.exe"
-\$sleepPrevention.StartInfo.Arguments = "/requestsoverride PROCESS DISPLAY \$pid"
-\$sleepPrevention.StartInfo.UseShellExecute = \$false
-\$sleepPrevention.Start()
+REM Wait for login to complete and FSLogix to mount profiles
+timeout /t 120 /nobreak
 
-# Ensure screen is unlocked
-\$wsh = New-Object -ComObject WScript.Shell
-\$wsh.SendKeys("%{TAB}")
-Start-Sleep -Seconds 1
-\$wsh.SendKeys(" ")
-
-# Log to a file the resume happened
-Add-Content -Path "C:\ProgramData\SolidCAM\resume_log.txt" -Value "VM resumed at \$(Get-Date)"
+REM Check if ShopFloorEditor is running
+tasklist /FI "IMAGENAME eq ShopFloorEditor.exe" | find "ShopFloorEditor.exe" > nul
+if errorlevel 1 (
+    echo ShopFloorEditor not running, attempting to start it >> C:\ProgramData\SolidCAM\verification_log.txt
+    start "" "$editorPath"
+) else (
+    echo ShopFloorEditor already running >> C:\ProgramData\SolidCAM\verification_log.txt
+)
 "@
-
-Set-Content -Path $postResumeScriptPath -Value $postResumeScript
-
-# Create a startup task to run the post-resume script
-$taskName = "SolidCAM-PostResume"
-$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($existingTask) {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-}
-
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$postResumeScriptPath`""
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-$principal = New-ScheduledTaskPrincipal -UserId "SolidCAMOperator1" -LogonType Interactive -RunLevel Highest
-
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
-Write-Output "Post-resume task created to ensure screen is visible after hibernation"
-
-# Set up auto-logon for SolidCAMOperator1
-$RegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
-Set-ItemProperty -Path $RegPath -Name "AutoAdminLogon" -Value "1" -Type String
-Set-ItemProperty -Path $RegPath -Name "DefaultUserName" -Value "SolidCAMOperator1" -Type String
-Set-ItemProperty -Path $RegPath -Name "DefaultPassword" -Value "Rt@wqPP7ZvUgtS7" -Type String
-Set-ItemProperty -Path $RegPath -Name "DefaultDomainName" -Value "." -Type String
-
-# Disable lock screen and screen saver
-$RegPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"
-if (!(Test-Path $RegPath)) {
-    New-Item -Path $RegPath -Force | Out-Null
-}
-Set-ItemProperty -Path $RegPath -Name "NoLockScreen" -Value 1 -Type DWord
-$RegPath = "HKCU:\Control Panel\Desktop"
-Set-ItemProperty -Path $RegPath -Name "ScreenSaveActive" -Value "0" -Type String
-
-# Configure power settings to prevent display from turning off
-& powercfg /change monitor-timeout-ac 0
-& powercfg /change standby-timeout-ac 0
-
-# Disable hibernate button and sleep button
-& powercfg /setacvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 96996bc0-ad50-47ec-923b-6f41874dd9eb 0
-& powercfg /setacvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 94ac6d29-73ce-41a6-809f-6363ba21b47e 0
-
-# Create a base initialization script
-$baseInitScript = @"
-# Base initialization script
-Add-Content -Path "C:\ProgramData\SolidCAM\initialization_log.txt" -Value "Initialization ran at \$(Get-Date)"
-
-# Keep the display on and session active
-\$wsh = New-Object -ComObject WScript.Shell
-while (\$true) {
-    # Send a harmless key combination every minute to prevent screen lock
-    \$wsh.SendKeys("+{F15}")
-    Start-Sleep -Seconds 60
-}
-"@
-Set-Content -Path "$scriptsDir\keep_active.ps1" -Value $baseInitScript
-
-# Create a task to run the initialization script
-$taskName = "SolidCAM-KeepActive"
-$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($existingTask) {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-}
-
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptsDir\keep_active.ps1`""
-$trigger = New-ScheduledTaskTrigger -AtLogon -User "SolidCAMOperator1"
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -Hidden
-$principal = New-ScheduledTaskPrincipal -UserId "SolidCAMOperator1" -LogonType Interactive -RunLevel Highest
-
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force
-Write-Output "Keep-active task created to prevent screen from locking"
-
-# Check if the SolidCAMOperator1 user exists, create if it doesn't
-$userExists = Get-LocalUser -Name "SolidCAMOperator1" -ErrorAction SilentlyContinue
-if (!$userExists) {
-    Write-Output "Creating SolidCAMOperator1 user account..."
-    $securePassword = ConvertTo-SecureString "Rt@wqPP7ZvUgtS7" -AsPlainText -Force
-    New-LocalUser -Name "SolidCAMOperator1" -Password $securePassword -FullName "SolidCAM Operator 1" -Description "SolidCAM User Account" -AccountNeverExpires
-    Add-LocalGroupMember -Group "Users" -Member "SolidCAMOperator1"
+    
+    $verificationScriptPath = "$startupScriptsDir\VerifyShopFloor.cmd"
+    Set-Content -Path $verificationScriptPath -Value $verificationScript -Force
+    
+    # Create task to run verification with a delay after startup
+    $verifyTaskName = "SolidCAM-DelayedVerification"
+    
+    # Remove existing task if present
+    schtasks /query /tn $verifyTaskName 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        schtasks /delete /tn $verifyTaskName /f
+    }
+    
+    # Create task running as SYSTEM at startup with higher priority
+    schtasks /create /tn $verifyTaskName /tr "$verificationScriptPath" /sc onstart /ru "SYSTEM" /f
+    
+    Write-Output "Verification task created successfully"
+} catch {
+    Write-Output "Error setting up auto-start mechanisms: $_"
 }
 
 # Check if SolidCAMOperator1 is logged in
 $operatorLoggedIn = query session SolidCAMOperator1 2>$null
 $isLoggedIn = ($LASTEXITCODE -eq 0)
 
-if ($isLoggedIn) {
-    Write-Output "SolidCAMOperator1 is logged in. Starting ShopFloorEditor..."
+if (!$isLoggedIn) {
+    Write-Output "SolidCAMOperator1 is not logged in. Configuring for auto-login at next boot."
     
-    # Create a simple launcher script that will run in the user's context
-    $launcherPath = "$scriptsDir\launch_editor.ps1"
-    
-    Set-Content -Path $launcherPath -Value "Start-Process -FilePath '$editorPath'"
-    
-    # Create and run a scheduled task to launch the application in the user's context
-    $taskName = "LaunchShopFloorEditor"
-    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($existingTask) {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    }
-    
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File $launcherPath"
-    $principal = New-ScheduledTaskPrincipal -UserId "SolidCAMOperator1" -LogonType Interactive -RunLevel Highest
-    
-    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force
-    Start-ScheduledTask -TaskName $taskName
-    
-    Write-Output "Waiting for ShopFloorEditor to start..."
-    
-    # Wait up to 30 seconds for the process to appear
-    $timeout = 30
-    $interval = 2
-    $elapsed = 0
-    
-    while ($elapsed -lt $timeout) {
-        Start-Sleep -Seconds $interval
-        $elapsed += $interval
+    try {
+        # We know this may not work now, but we can set up the system for next boot
+        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
         
-        $shopFloorProcess = Get-Process -Name "ShopFloorEditor" -ErrorAction SilentlyContinue
-        if ($shopFloorProcess) {
-            Write-Output "ShopFloorEditor started successfully with PID: $($shopFloorProcess.Id)"
-            
-            # Wait an additional 10 seconds for the application to initialize
-            Write-Output "Waiting 10 more seconds for initialization..."
-            Start-Sleep -Seconds 10
-            
-            # Clean up the task
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-            
-            Write-Output "ShopFloorEditor is running and ready for hibernation"
-            exit 0
+        # Set auto-logon values
+        Set-ItemProperty -Path $regPath -Name "AutoAdminLogon" -Value "1" -Type String
+        Set-ItemProperty -Path $regPath -Name "DefaultUserName" -Value "SolidCAMOperator1" -Type String
+        Set-ItemProperty -Path $regPath -Name "DefaultPassword" -Value "Rt@wqPP7ZvUgtS7" -Type String
+        
+        Write-Output "Auto-login configured for next boot"
+        
+        # Create evidence that we've set this up
+        Set-Content -Path "C:\ProgramData\SolidCAM\auto_login_configured.txt" -Value "Configured at $(Get-Date)" -Force
+        
+        # Create a global startup shortcut that will work even with FSLogix
+        $allUsersStartupFolder = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+        if (!(Test-Path $allUsersStartupFolder)) {
+            New-Item -Path $allUsersStartupFolder -ItemType Directory -Force | Out-Null
         }
         
-        Write-Output "Still waiting... ($elapsed seconds elapsed)"
+        # Use a VBScript to create the shortcut (more compatible)
+        $shortcutScript = @"
+Set oWS = WScript.CreateObject("WScript.Shell")
+sLinkFile = "$allUsersStartupFolder\ShopFloorEditor.lnk"
+Set oLink = oWS.CreateShortcut(sLinkFile)
+oLink.TargetPath = "$editorPath"
+oLink.Save
+"@
+        
+        $scriptPath = "C:\ProgramData\SolidCAM\create_shortcut.vbs"
+        Set-Content -Path $scriptPath -Value $shortcutScript -Force
+        
+        # Run the script to create the shortcut
+        Start-Process -FilePath "cscript.exe" -ArgumentList "//nologo `"$scriptPath`"" -NoNewWindow -Wait
+        
+        Write-Output "Global startup shortcut created successfully"
+        
+        # Since the user isn't logged in, we'll exit here. Next boot will auto-start the app.
+        Write-Output "ShopFloorEditor will start automatically after next VM restart and user login."
+        exit 0
+    } catch {
+        Write-Output "Error during auto-login configuration: $_"
+        exit 1
     }
-    
-    Write-Output "Failed to detect ShopFloorEditor process after $timeout seconds"
-    exit 1
-    
 } else {
-    Write-Output "SolidCAMOperator1 is not logged in."
+    Write-Output "SolidCAMOperator1 is logged in. Attempting to start ShopFloorEditor directly..."
     
-    # Create auto-start for ShopFloorEditor
-    Write-Output "Setting up auto-start for ShopFloorEditor on login..."
-    $startupFolder = "C:\Users\SolidCAMOperator1\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
-    
-    if (!(Test-Path $startupFolder)) {
-        New-Item -Path $startupFolder -ItemType Directory -Force | Out-Null
+    # Try to get the user's session ID
+    try {
+        $sessions = query session | Out-String
+        $sessionLines = $sessions -split "`n" | Where-Object { $_ -match "SolidCAMOperator1" }
+        
+        if ($sessionLines) {
+            $sessionLine = $sessionLines[0]
+            $sessionId = [regex]::Match($sessionLine, '\s+(\d+)\s+').Groups[1].Value
+            
+            if ($sessionId) {
+                Write-Output "Found session ID: $sessionId"
+                
+                # Method 1: Try using RunAsUser to start the process in the user's session
+                $runAsMethod1Success = $false
+                
+                try {
+                    # Create a cmd script to execute
+                    $cmdScript = @"
+@echo off
+start "" "$editorPath"
+"@
+                    $cmdScriptPath = "C:\ProgramData\SolidCAM\launch_shopfloor.cmd"
+                    Set-Content -Path $cmdScriptPath -Value $cmdScript -Force
+                    
+                    # Use PsExec if available or another method to run in user's session
+                    $psExecPath = "C:\Windows\System32\PsExec.exe"
+                    if (Test-Path $psExecPath) {
+                        Start-Process -FilePath $psExecPath -ArgumentList "-accepteula -i $sessionId -s cmd /c `"$cmdScriptPath`"" -NoNewWindow
+                        Start-Sleep -Seconds 5
+                        $runAsMethod1Success = $true
+                        Write-Output "Attempted to start ShopFloorEditor using PsExec"
+                    }
+                } catch {
+                    Write-Output "Error with Method 1: $_"
+                }
+                
+                # Method 2: Use scheduled task to run immediately
+                if (!$runAsMethod1Success) {
+                    try {
+                        # Create unique task name
+                        $taskName = "SolidCAM-LaunchNow-$([Guid]::NewGuid().ToString('N'))"
+                        
+                        # Create the task directly with schtasks command
+                        schtasks /create /tn $taskName /tr "`"$editorPath`"" /sc once /st 00:00 /ru SolidCAMOperator1 /f
+                        
+                        if ($LASTEXITCODE -eq 0) {
+                            # Run the task immediately
+                            schtasks /run /tn $taskName
+                            Start-Sleep -Seconds 5
+                            
+                            # Try to clean up
+                            schtasks /delete /tn $taskName /f 2>$null
+                            
+                            Write-Output "Attempted to start ShopFloorEditor using scheduled task"
+                        } else {
+                            Write-Output "Failed to create task: ExitCode=$LASTEXITCODE"
+                        }
+                    } catch {
+                        Write-Output "Error with Method 2: $_"
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Output "Error determining session: $_"
     }
     
-    # Create a shortcut
-    $shortcutPath = "$startupFolder\ShopFloorEditor.lnk"
-    $WshShell = New-Object -ComObject WScript.Shell
-    $Shortcut = $WshShell.CreateShortcut($shortcutPath)
-    $Shortcut.TargetPath = $editorPath
-    $Shortcut.Save()
+    # Method 3: Direct method as fallback (may not work with FSLogix but worth trying)
+    try {
+        Write-Output "Trying direct launch method..."
+        Start-Process -FilePath $editorPath -NoNewWindow
+    } catch {
+        Write-Output "Error with direct method: $_"
+    }
     
-    Write-Output "Auto-login and auto-start configured. ShopFloorEditor will start after next boot when SolidCAMOperator1 logs in."
+    # Wait for it to initialize
+    Start-Sleep -Seconds 10
     
-    # We can't launch ShopFloorEditor now since SolidCAMOperator1 isn't logged in
-    exit 0
+    # Final verification
+    $shopFloorProcess = Get-Process -Name "ShopFloorEditor" -ErrorAction SilentlyContinue
+    if ($shopFloorProcess) {
+        Write-Output "SUCCESS: ShopFloorEditor is now running with PID: $($shopFloorProcess.Id)"
+    } else {
+        Write-Output "WARNING: ShopFloorEditor was not found running after all attempts"
+        Write-Output "ShopFloorEditor launch will be attempted automatically at next VM startup"
+    }
 }
+
+Write-Output "=== ShopFloorEditor launch process complete ==="
