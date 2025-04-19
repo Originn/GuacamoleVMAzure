@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -112,36 +113,21 @@ namespace DeployVMFunction
         /// </summary>
         private async Task LaunchShopFloorAndHibernateAsync(VirtualMachineResource vm)
         {
-            _logger.LogInformation($"Launching ShopFloorEditor and hibernating VM {vm.Data.Name}...");
-            // Prepare PowerShell commands to run on the VM
-            var commands = new List<string>
+            // Execute hibernation_setup.ps1, which configures auto-logon, schedules RunOnce launch and reboot + hibernation
+            var scriptPath = Path.Combine(Environment.CurrentDirectory, "hibernation_setup.ps1");
+            if (!File.Exists(scriptPath))
             {
-                "Write-Output \"=== Starting ShopFloorEditor ===\"",
-                "Start-Process -FilePath 'C:\\Program Files\\SolidCAM2024 Maker\\solidcam\\ShopFloorEditor.exe'",
-                "Write-Output \"Waiting for ShopFloorEditor to initialize...\"",
-                "Start-Sleep -Seconds 30",
-                "Write-Output \"Enabling hibernation...\"",
-                "powercfg /hibernate on",
-                "powercfg /h /type full"
-            };
+                throw new FileNotFoundException($"Cannot find hibernation script at {scriptPath}");
+            }
+            var scriptLines = File.ReadAllLines(scriptPath);
             var runCommandInput = new RunCommandInput("RunPowerShellScript");
-            foreach (var cmd in commands)
+            foreach (var line in scriptLines)
             {
-                runCommandInput.Script.Add(cmd);
+                runCommandInput.Script.Add(line);
             }
-            // Execute the script on the VM
-            var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
-            if (result?.Value?.Value != null)
-            {
-                foreach (var output in result.Value.Value)
-                {
-                    _logger.LogInformation($"Script output: {output.Message}");
-                }
-            }
-            // Hibernate the VM
-            _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
-            await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
-            _logger.LogInformation($"VM {vm.Data.Name} hibernation initiated");
+            _logger.LogInformation($"Executing hibernation setup script on VM {vm.Data.Name}...");
+            // Use Started so that the command is issued and VM can restart without awaiting full completion
+            await vm.RunCommandAsync(WaitUntil.Started, runCommandInput);
         }
 
         /// <summary>

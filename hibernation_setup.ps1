@@ -23,10 +23,37 @@ Write-Output "=== Preparing VM for hibernation with ShopFloorEditor running for 
 
 # 1. Ensure hibernation is enabled and set to full
 Write-Output "1) Enabling full hibernation..."
+# 1b) Ensure hibernation and prepare auto-logon + RunOnce logic
 powercfg /hibernate on
 powercfg /h /type full
 
-# 2. Configure auto-login and auto-start mechanisms compatible with FSLogix
+# 2) Configure auto-logon for SolidCAMOperator1
+Write-Output "Configuring AutoAdminLogon for SolidCAMOperator1"
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d SolidCAMOperator1 /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d Rt@wqPP7ZvUgtS7 /f
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultDomainName /t REG_SZ /d . /f
+
+# 3) Create finalize hibernation script and one-time RunOnce entry
+$finalizeScript = @'
+Start-Process -FilePath "C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe"
+Start-Sleep -Seconds 30
+# Cleanup RunOnce trigger
+reg delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v FinalizeHibernation /f
+# Disable auto-logon
+reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f
+# Hibernate the system
+shutdown /h
+'@
+$scriptPath = "C:\ProgramData\SolidCAM\finalize_hibernate.ps1"
+Set-Content -Path $scriptPath -Value $finalizeScript -Force
+reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" /v FinalizeHibernation /t REG_SZ /d "powershell -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`"" /f
+
+# 4) Restart to trigger auto-logon and finalize script
+Write-Output "Restarting system to initiate interactive login and finalize hibernation"
+shutdown /r /t 0 /f
+Write-Output "Script hibernation_setup.ps1 completed: exiting before legacy logic."
+exit 0
 $editorPath = "C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe"
 Write-Output "2) Checking if ShopFloorEditor is running for SolidCAMOperator1..."
 
