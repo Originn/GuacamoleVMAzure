@@ -108,56 +108,40 @@ namespace DeployVMFunction
         }
 
         /// <summary>
-        /// Launch ShopFloorEditor for SolidCAMOperator1 and hibernate the VM - without any image modifications
+        /// Launch ShopFloorEditor for SolidCAMOperator1 and hibernate the VM
         /// </summary>
         private async Task LaunchShopFloorAndHibernateAsync(VirtualMachineResource vm)
         {
-            try
+            _logger.LogInformation($"Launching ShopFloorEditor and hibernating VM {vm.Data.Name}...");
+            // Prepare PowerShell commands to run on the VM
+            var commands = new List<string>
             {
-                _logger.LogInformation($"Starting ShopFloorEditor for VM {vm.Data.Name}...");
-
-                // Execute run_shopfloor.ps1 script
-                var scriptPath = Path.Combine(Environment.CurrentDirectory, "run_shopfloor.ps1");
-                if (!File.Exists(scriptPath))
-                    throw new FileNotFoundException($"Cannot find {scriptPath}");
-
-                // Read all lines from the script
-                var scriptLines = File.ReadAllLines(scriptPath);
-
-                // Build the RunCommand input
-                var runCommandInput = new RunCommandInput("RunPowerShellScript");
-                foreach (var line in scriptLines)
-                {
-                    runCommandInput.Script.Add(line);
-                }
-
-                // Execute it
-                var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
-                _logger.LogInformation($"ShopFloorEditor launch attempted on VM {vm.Data.Name}");
-                
-                // Log any output from the script
-                if (result?.Value?.Value != null)
-                {
-                    foreach (var outp in result.Value.Value)
-                    {
-                        _logger.LogInformation($"Script output: {outp.Message}");
-                    }
-                }
-
-                // Wait a bit more to ensure application is loaded
-                _logger.LogInformation($"Waiting for ShopFloorEditor to fully load...");
-                await Task.Delay(TimeSpan.FromSeconds(30));
-
-                // Now hibernate the VM
-                _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
-                // Pass true to run the pre-hibernation executable
-                await HibernateVMAsync(vm, true);
-            }
-            catch (Exception ex)
+                "Write-Output \"=== Starting ShopFloorEditor ===\"",
+                "Start-Process -FilePath 'C:\\Program Files\\SolidCAM2024 Maker\\solidcam\\ShopFloorEditor.exe'",
+                "Write-Output \"Waiting for ShopFloorEditor to initialize...\"",
+                "Start-Sleep -Seconds 30",
+                "Write-Output \"Enabling hibernation...\"",
+                "powercfg /hibernate on",
+                "powercfg /h /type full"
+            };
+            var runCommandInput = new RunCommandInput("RunPowerShellScript");
+            foreach (var cmd in commands)
             {
-                _logger.LogError(ex, $"Error in LaunchShopFloorAndHibernateAsync for VM {vm.Data.Name}");
-                throw;
+                runCommandInput.Script.Add(cmd);
             }
+            // Execute the script on the VM
+            var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+            if (result?.Value?.Value != null)
+            {
+                foreach (var output in result.Value.Value)
+                {
+                    _logger.LogInformation($"Script output: {output.Message}");
+                }
+            }
+            // Hibernate the VM
+            _logger.LogInformation($"Hibernating VM {vm.Data.Name}...");
+            await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
+            _logger.LogInformation($"VM {vm.Data.Name} hibernation initiated");
         }
 
         /// <summary>
