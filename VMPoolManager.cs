@@ -141,106 +141,11 @@ namespace DeployVMFunction
                 }
             }
 
-            // The script initiates a restart and then hibernation, so we need to wait for that to complete
-            _logger.LogInformation($"Hibernation script executed on VM {vm.Data.Name}. Monitoring VM state for hibernation completion...");
-            
-            // Wait for VM to restart and enter hibernation state (max 10 minutes)
-            bool hibernationComplete = false;
-            DateTime startTime = DateTime.UtcNow;
-            TimeSpan timeout = TimeSpan.FromMinutes(10);
-            
-            while (!hibernationComplete && (DateTime.UtcNow - startTime) < timeout)
-            {
-                // Wait between checks
-                await Task.Delay(TimeSpan.FromSeconds(30));
-                
-                try
-                {
-                    // Check VM power state
-                    var instanceView = await vm.InstanceViewAsync();
-                    var statuses = instanceView?.Value?.Statuses;
-                    
-                    if (statuses != null)
-                    {
-                        var powerState = statuses.FirstOrDefault(s => s.Code != null && s.Code.StartsWith("PowerState/"))?.Code;
-                        var hibernateState = statuses.FirstOrDefault(s => s.Code != null && s.Code.StartsWith("HibernationState/"))?.Code;
-                        
-                        _logger.LogInformation($"Current VM state: PowerState={powerState}, HibernationState={hibernateState}");
-                        
-                        // Check if VM is hibernated or deallocated
-                        if (powerState == "PowerState/deallocated" || 
-                            powerState == "PowerState/stopped" || 
-                            hibernateState == "HibernationState/Hibernated")
-                        {
-                            hibernationComplete = true;
-                            _logger.LogInformation($"VM {vm.Data.Name} has been successfully hibernated.");
-                            break;
-                        }
-                        else if (powerState == "PowerState/running")
-                        {
-                            _logger.LogInformation($"VM {vm.Data.Name} is still running. Waiting for hibernation to complete...");
-                        }
-                        else if (powerState == "PowerState/starting" || powerState == "PowerState/stopping")
-                        {
-                            _logger.LogInformation($"VM {vm.Data.Name} is transitioning ({powerState}). Waiting for hibernation to complete...");
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning($"Error checking VM state: {ex.Message}. Will continue waiting.");
-                }
-            }
-            
-            if (!hibernationComplete)
-            {
-                _logger.LogWarning($"Timeout waiting for VM {vm.Data.Name} to hibernate. Attempting manual hibernation...");
-                try
-                {
-                    // Force hibernation as a fallback
-                    await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
-                    _logger.LogInformation($"Manual hibernation of VM {vm.Data.Name} completed.");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, $"Failed to manually hibernate VM {vm.Data.Name}. Attempting normal deallocation...");
-                    await vm.DeallocateAsync(WaitUntil.Completed);
-                    _logger.LogInformation($"VM {vm.Data.Name} manually deallocated as last resort.");
-                }
-            }
+            // The hibernation_setup.ps1 script schedules auto-logon and final hibernation in the interactive user session,
+            // then issues a reboot. We do not need to poll for completion here.
+            _logger.LogInformation($"Hibernation setup script executed on VM {vm.Data.Name}. VM will reboot, auto-log on in Session 1, run ShopFloorEditor, and hibernate.");
         }
 
-        /// <summary>
-        /// Quick launch ShopFloorEditor via RunCommand and hibernate VM via Azure-side deallocate.
-        /// </summary>
-        private async Task QuickLaunchAndHibernateAsync(VirtualMachineResource vm)
-        {
-            _logger.LogInformation($"Starting ShopFloorEditor on VM {vm.Data.Name} via RunCommand");
-            var runCommand = new RunCommandInput("RunPowerShellScript");
-            runCommand.Script.Add("Start-Process -FilePath \"C:\\Program Files\\SolidCAM2024 Maker\\solidcam\\ShopFloorEditor.exe\"");
-            var result = await vm.RunCommandAsync(WaitUntil.Completed, runCommand);
-            if (result?.Value?.Value != null)
-            {
-                foreach (var output in result.Value.Value)
-                {
-                    _logger.LogInformation($"RunCommand output: {output.Message}");
-                }
-            }
-            // Give the process time to start
-            await Task.Delay(TimeSpan.FromSeconds(15));
-            _logger.LogInformation($"Attempting Azure-side hibernation for VM {vm.Data.Name}");
-            try
-            {
-                await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
-                _logger.LogInformation($"VM {vm.Data.Name} successfully hibernated via deallocation.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, $"Failed to deallocate VM {vm.Data.Name} with hibernation; falling back to normal deallocation.");
-                await vm.DeallocateAsync(WaitUntil.Completed);
-                _logger.LogInformation($"VM {vm.Data.Name} deallocated normally.");
-            }
-        }
 
         /// <summary>
         /// Get current status of the VM pool (VMs named SolidCAM-VM-Pool-*)
@@ -603,8 +508,8 @@ namespace DeployVMFunction
                                 _logger.LogWarning($"Failed to configure user accounts for VM {vm.Data.Name}");
                             }
 
-                            // Launch ShopFloorEditor and hibernate VM via Azure-side deallocation
-                            await QuickLaunchAndHibernateAsync(vm);
+                            // Launch ShopFloorEditor in interactive session and schedule hibernation via guest script
+                            await LaunchShopFloorAndHibernateAsync(vm);
                             
                             return vm;
                         }
