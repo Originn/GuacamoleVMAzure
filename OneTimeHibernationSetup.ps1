@@ -15,7 +15,7 @@ reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultP
 # Create one-time scheduled task to start ShopFloorEditor at logon
 $taskName = "OneTimeShopFloorStarter"
 schtasks /Delete /TN $taskName /F 2>$null
-$action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"Start-Process -FilePath 'C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe'; Start-Sleep -Seconds 10; schtasks /Delete /TN $taskName /F\""
+$action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"Start-Process 'C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe'; Start-Sleep -Seconds 10; schtasks /Delete /TN $taskName /F`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "SolidCAMOperator1"
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force
