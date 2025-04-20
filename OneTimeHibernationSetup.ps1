@@ -30,6 +30,9 @@ $bmp.Save('C:\ProgramData\SolidCAM\screenshot.png', [System.Drawing.Imaging.Imag
 schtasks /Delete /TN 'OneTimeShopFloorStarter' /F -ErrorAction SilentlyContinue
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 "@
+if (!(Test-Path -Path (Split-Path -Parent $captureScriptPath) -PathType Container)) {
+    New-Item -Path (Split-Path -Parent $captureScriptPath) -ItemType Directory -Force
+}
 $captureScript | Out-File -FilePath $captureScriptPath -Encoding UTF8
 schtasks /Delete /TN 'OneTimeShopFloorStarter' /F 2>$null
 schtasks /Create /TN 'OneTimeShopFloorStarter' /SC ONLOGON /RU 'SolidCAMOperator1' /RL HIGHEST /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File '$captureScriptPath'" /F
