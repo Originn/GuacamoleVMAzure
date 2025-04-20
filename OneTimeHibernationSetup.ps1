@@ -29,10 +29,10 @@ if (-not (Test-Path 'C:\ProgramData\SolidCAM')) { New-Item -Path 'C:\ProgramData
 $bmp.Save('C:\ProgramData\SolidCAM\screenshot.png', [System.Drawing.Imaging.ImageFormat]::Png)
 schtasks /Delete /TN 'OneTimeShopFloorStarter' /F -ErrorAction SilentlyContinue
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
-"@"
+"@
 $captureScript | Out-File -FilePath $captureScriptPath -Encoding UTF8
 schtasks /Delete /TN 'OneTimeShopFloorStarter' /F 2>$null
-schtasks /Create /TN 'OneTimeShopFloorStarter' /SC ONLOGON /RU 'SolidCAMOperator1' /RL HIGHEST /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$captureScriptPath`"" /F
+schtasks /Create /TN 'OneTimeShopFloorStarter' /SC ONLOGON /RU 'SolidCAMOperator1' /RL HIGHEST /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File '$captureScriptPath'" /F
 Write-Output "Creating permanent scheduled task for ShopFloorEditor on every user logon"
 # Define permanent scheduled task using PowerShell cmdlets to avoid quoting issues
 $actionPerm = New-ScheduledTaskAction -Execute "C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe"
