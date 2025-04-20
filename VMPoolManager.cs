@@ -55,7 +55,7 @@ namespace DeployVMFunction
             _vnetName = Environment.GetEnvironmentVariable("VNET_NAME") ?? "SolidCAM-Golden-Image-vnet";
             _subnetName = Environment.GetEnvironmentVariable("SUBNET_NAME") ?? "default";
             _galleryImageId = Environment.GetEnvironmentVariable("GALLERY_IMAGE_ID") ??
-                "/subscriptions/05329ba1-6d97-4b22-808c-9f448c4e9a11/resourceGroups/SolidCAM-Golden-Image_group/providers/Microsoft.Compute/galleries/solidcam_image_gallery/images/SolidCAM-Multisession-Hibernate/versions/0.0.6";
+                "/subscriptions/05329ba1-6d97-4b22-808c-9f448c4e9a11/resourceGroups/SolidCAM-Golden-Image_group/providers/Microsoft.Compute/galleries/solidcam_image_gallery/images/SolidCAM-Multisession-Hibernate/versions/0.0.7";
             _guacamoleServerPrivateIp = Environment.GetEnvironmentVariable("GUACAMOLE_SERVER_PRIVATE_IP") ?? ""; // Required
             
             // Set location based on environment variable or default to NorthEurope
