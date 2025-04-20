@@ -298,6 +298,15 @@ namespace DeployVMFunction
                 log.LogInformation($"VM {vmName} is in running state. Skipping RDP service availability check.");
                 // Skip the RDP service check and assume the VM is ready
                 bool isRdpReady = true;
+                
+                // --- Prepare Guacamole token authentication ---
+                log.LogInformation($"Preparing Guacamole connection for VM {vmName} ({targetVmPrivateIp})...");
+                string tokenUrl = $"{guacamoleApiBaseUrl.TrimEnd('/')}/api/tokens";
+                log.LogInformation($"Attempting Guac auth token: POST {tokenUrl}");
+                string? authToken = null;
+                string? dataSource = null;
+                try
+                {
                     var tokenRequestContent = new FormUrlEncodedContent(new[] { 
                         new KeyValuePair<string, string>("username", guacamoleApiUsername), 
                         new KeyValuePair<string, string>("password", guacamoleApiPassword) 

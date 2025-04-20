@@ -150,10 +150,10 @@ namespace DeployVMFunction
             await vm.RestartAsync(WaitUntil.Completed);
 
             // Allow time for auto-logon and scheduled task to run inside the VM
-            // Increased wait time to 90 seconds to ensure VM has enough time to restart,
+            // Increased wait time to 180 seconds to ensure VM has enough time to restart,
             // auto-login as SolidCAMOperator1, and launch ShopFloorEditor
-            _logger.LogInformation($"Waiting 90 seconds for scheduled startup to execute on VM {vm.Data.Name}...");
-            await Task.Delay(TimeSpan.FromSeconds(90));
+            _logger.LogInformation($"Waiting 180 seconds for scheduled startup to execute on VM {vm.Data.Name}...");
+            await Task.Delay(TimeSpan.FromSeconds(180));
 
             _logger.LogInformation($"Hibernating VM {vm.Data.Name} via Azure...");
             // Use DeallocateAsync with hibernate=true for proper hibernation
