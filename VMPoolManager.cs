@@ -153,9 +153,9 @@ namespace DeployVMFunction
             _logger.LogInformation($"Waiting 60 seconds for scheduled startup to execute on VM {vm.Data.Name}...");
             await Task.Delay(TimeSpan.FromSeconds(60));
 
-            _logger.LogInformation($"Stopping VM {vm.Data.Name} via Azure...");
-            // Note: using skipShutdown:false to stop the VM (hibernate flag not supported in this SDK version)
-            await vm.PowerOffAsync(WaitUntil.Completed, skipShutdown: false);
+            _logger.LogInformation($"Hibernating VM {vm.Data.Name} via Azure...");
+            // Use DeallocateAsync with hibernate=true for proper hibernation
+            await vm.DeallocateAsync(WaitUntil.Completed, hibernate: true);
             _logger.LogInformation($"VM {vm.Data.Name} should now be hibernated with ShopFloorEditor initialized.");
         }
 
