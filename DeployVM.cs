@@ -267,68 +267,37 @@ namespace DeployVMFunction
                     log.LogInformation($"VM {vmName} is already running, skipping hibernation check and startup");
                 }
                 
-                // Run RDP service activation for both new and existing VMs to ensure it's active
-                // For existing VMs, this is less likely to be needed but doesn't hurt
+                // Run a single combined RDP service activation and admin rights in one script
                 _ = Task.Run(async () => {
                     try {
-                        log.LogInformation($"Running proactive RDP service check and activation for {vmName}...");
-                        var proactiveScript = @"$s = Get-Service -Name 'TermService' -EA SilentlyContinue; if ($s) { Start-Service -Name 'TermService' -Force; Set-Service -Name 'TermService' -StartupType Automatic; Write-Output 'PREEMPTIVE_RDP_SERVICE_START' } else { Write-Output 'RDP_SERVICE_NOT_FOUND' }";
+                        log.LogInformation($"Running combined service configuration for {vmName}...");
+                        var combinedScript = @"
+                            # Part 1: Add SolidCAMOperator1 to local Administrators group
+                            Add-LocalGroupMember -Group 'Administrators' -Member 'SolidCAMOperator1' -ErrorAction SilentlyContinue
+                            Write-Output 'ADMIN_ADDED'
+
+                            # Part 2: Ensure RDP service is running and set to automatic startup
+                            $s = Get-Service -Name 'TermService' -EA SilentlyContinue
+                            if ($s) {
+                                Start-Service -Name 'TermService' -Force
+                                Set-Service -Name 'TermService' -StartupType Automatic
+                                Write-Output 'RDP_SERVICE_ACTIVATED'
+                            } else {
+                                Write-Output 'RDP_SERVICE_NOT_FOUND'
+                            }
+                        ";
                         var cmdInput = new RunCommandInput("RunPowerShellScript");
-                        cmdInput.Script.Add(proactiveScript);
+                        cmdInput.Script.Add(combinedScript);
                         await vm.RunCommandAsync(WaitUntil.Started, cmdInput);
+                        log.LogInformation($"Combined VM configuration successful for {vmName}");
                     } catch (Exception ex) {
-                        log.LogWarning(ex, $"Could not run proactive RDP service start for {vmName}");
-                    }
-                });
-                // Grant SolidCAMOperator1 local admin privileges for console RDP test
-                _ = Task.Run(async () => {
-                    try {
-                        log.LogInformation($"Adding SolidCAMOperator1 to local Administrators group on {vmName}...");
-                        var adminScript = @"Add-LocalGroupMember -Group 'Administrators' -Member 'SolidCAMOperator1' -ErrorAction SilentlyContinue; Write-Output 'ADMIN_ADDED'";
-                        var cmdInputAdmin = new RunCommandInput("RunPowerShellScript");
-                        cmdInputAdmin.Script.Add(adminScript);
-                        await vm.RunCommandAsync(WaitUntil.Started, cmdInputAdmin);
-                    } catch (Exception ex) {
-                        log.LogWarning(ex, $"Failed to grant admin rights to SolidCAMOperator1 on {vmName}");
+                        log.LogWarning(ex, $"Failed to run combined configuration script for {vmName}");
                     }
                 });
                 
                 log.LogInformation($"VM {vmName} is in running state. Skipping RDP service availability check.");
                 // Skip the RDP service check and assume the VM is ready
                 bool isRdpReady = true;
-                
-                // Run RDP service activation in background to ensure it's ready when the user connects
-                _ = Task.Run(async () => {
-                    try {
-                        log.LogInformation($"Running background RDP service activation for {vmName}...");
-                        var rdpActivationScript = @"$s = Get-Service -Name 'TermService' -EA SilentlyContinue; 
-                            if ($s) { 
-                                Start-Service -Name 'TermService' -Force; 
-                                Set-Service -Name 'TermService' -StartupType Automatic; 
-                                Write-Output 'RDP_SERVICE_ACTIVATED' 
-                            } else { 
-                                Write-Output 'RDP_SERVICE_NOT_FOUND' 
-                            }";
-                        var cmdInput = new RunCommandInput("RunPowerShellScript");
-                        cmdInput.Script.Add(rdpActivationScript);
-                        await vm.RunCommandAsync(WaitUntil.Started, cmdInput);
-                    } catch (Exception ex) {
-                        log.LogWarning(ex, $"Could not run background RDP service activation for {vmName}");
-                    }
-                });
-
-                // Always use the default password
-                randomPassword = "Rt@wqPP7ZvUgtS7"; // Default password
-                log.LogInformation($"Using default password for VM {vmName}");
-                
-                // --- Prepare Guacamole token authentication ---
-                log.LogInformation($"Preparing Guacamole connection for VM {vmName} ({targetVmPrivateIp})...");
-                string tokenUrl = $"{guacamoleApiBaseUrl.TrimEnd('/')}/api/tokens";
-                log.LogInformation($"Attempting Guac auth token: POST {tokenUrl}");
-                string? authToken = null;
-                string? dataSource = null;
-                try
-                {
                     var tokenRequestContent = new FormUrlEncodedContent(new[] { 
                         new KeyValuePair<string, string>("username", guacamoleApiUsername), 
                         new KeyValuePair<string, string>("password", guacamoleApiPassword) 
