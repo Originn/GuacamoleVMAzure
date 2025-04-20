@@ -34,4 +34,8 @@ $captureScript | Out-File -FilePath $captureScriptPath -Encoding UTF8
 schtasks /Delete /TN 'OneTimeShopFloorStarter' /F 2>$null
 schtasks /Create /TN 'OneTimeShopFloorStarter' /SC ONLOGON /RU 'SolidCAMOperator1' /RL HIGHEST /TR "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$captureScriptPath`"" /F
 Write-Output "Creating permanent scheduled task for ShopFloorEditor on every user logon"
-schtasks /Create /TN "ShopFloorEditorAtLogon" /SC ONLOGON /RL HIGHEST /TR "\"C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe\"" /F
+# Define permanent scheduled task using PowerShell cmdlets to avoid quoting issues
+$actionPerm = New-ScheduledTaskAction -Execute "C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe"
+$triggerPerm = New-ScheduledTaskTrigger -AtLogOn
+$principalPerm = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName "ShopFloorEditorAtLogon" -Action $actionPerm -Trigger $triggerPerm -Principal $principalPerm -Force
