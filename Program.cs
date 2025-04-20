@@ -145,7 +145,7 @@ namespace DeployVMFunction
 
                 // Read pool configuration settings
                 int minPoolSize = configuration.GetValue("MIN_POOL_SIZE", 2);
-                int warmupDelaySeconds = configuration.GetValue("VMPoolSettings__WarmupDelaySeconds", 180);
+                int warmupDelaySeconds = configuration.GetValue("VMPoolSettings__WarmupDelaySeconds", 90);
                 int maxServiceCheckAttempts = configuration.GetValue("VMPoolSettings__MaxServiceCheckAttempts", 10);
                 int serviceCheckDelaySeconds = configuration.GetValue("VMPoolSettings__ServiceCheckDelaySeconds", 10);
 

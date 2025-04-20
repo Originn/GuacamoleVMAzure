@@ -150,10 +150,10 @@ namespace DeployVMFunction
             await vm.RestartAsync(WaitUntil.Completed);
 
             // Allow time for auto-logon and scheduled task to run inside the VM
-            // Increased wait time to 180 seconds to ensure VM has enough time to restart,
+            // Increased wait time to 90 seconds to ensure VM has enough time to restart,
             // auto-login as SolidCAMOperator1, and launch ShopFloorEditor
-            _logger.LogInformation($"Waiting 180 seconds for scheduled startup to execute on VM {vm.Data.Name}...");
-            await Task.Delay(TimeSpan.FromSeconds(180));
+            _logger.LogInformation($"Waiting 90 seconds for scheduled startup to execute on VM {vm.Data.Name}...");
+            await Task.Delay(TimeSpan.FromSeconds(90));
 
             _logger.LogInformation($"Hibernating VM {vm.Data.Name} via Azure...");
             // Use DeallocateAsync with hibernate=true for proper hibernation
@@ -436,7 +436,6 @@ namespace DeployVMFunction
                             SubnetResource subnet = await existingVnet.GetSubnets().GetAsync(_subnetName);
 
                             // Create NSG
-                            _logger.LogInformation($"Creating NSG for pool VM {vmName}: {nsgName}");
                             var nsgData = new NetworkSecurityGroupData()
                             {
                                 Location = locationOption,
@@ -447,6 +446,12 @@ namespace DeployVMFunction
                                         Name = "AllowRDP_From_Guacamole", Priority = 1000, Access = SecurityRuleAccess.Allow, Direction = SecurityRuleDirection.Inbound,
                                         Protocol = SecurityRuleProtocol.Tcp, SourceAddressPrefix = _guacamoleServerPrivateIp, SourcePortRange = "*",
                                         DestinationAddressPrefix = "*", DestinationPortRange = "3389"
+                                    },
+                                    new SecurityRuleData()
+                                    {
+                                        Name = "AllowRDP_From_Internet", Priority = 1100, Access = SecurityRuleAccess.Allow, Direction = SecurityRuleDirection.Inbound,
+                                        Protocol = SecurityRuleProtocol.Tcp, SourceAddressPrefix = "*", SourcePortRange = "*",
+                                        DestinationAddressPrefix = "*", DestinationPortRange = "3389"
                                     }
                                 }
                             };
@@ -455,13 +460,31 @@ namespace DeployVMFunction
                             nsg = nsgCreateOp.Value;
                             _logger.LogInformation($"NSG created: {nsg.Id}");
 
+                            // Create Public IP
+                            _logger.LogInformation($"Creating public IP for pool VM {vmName}...");
+                            var publicIpName = $"vm-pip-pool-{timestamp}";
+                            var publicIpData = new PublicIPAddressData() 
+                            {
+                                Location = locationOption,
+                                PublicIPAllocationMethod = NetworkIPAllocationMethod.Dynamic
+                            };
+                            var pipCollection = _resourceGroup.GetPublicIPAddresses();
+                            var pipCreateOp = await pipCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, publicIpName, publicIpData);
+                            var pip = pipCreateOp.Value;
+                            _logger.LogInformation($"Public IP created: {pip.Id}");
                             // Create NIC
                             _logger.LogInformation($"Creating network interface {nicName} in subnet {subnet.Id}");
                             var nicData = new NetworkInterfaceData()
                             {
                                 Location = locationOption,
                                 NetworkSecurityGroup = new NetworkSecurityGroupData() { Id = nsg.Id },
-                                IPConfigurations = { new NetworkInterfaceIPConfigurationData() { Name = "ipconfig1", Primary = true, Subnet = new SubnetData() { Id = subnet.Id }, PrivateIPAllocationMethod = NetworkIPAllocationMethod.Dynamic } }
+                                IPConfigurations = { new NetworkInterfaceIPConfigurationData() { 
+                                    Name = "ipconfig1", 
+                                    Primary = true, 
+                                    Subnet = new SubnetData() { Id = subnet.Id }, 
+                                    PrivateIPAllocationMethod = NetworkIPAllocationMethod.Dynamic,
+                                    PublicIPAddress = new PublicIPAddressData() { Id = pip.Id }
+                                } }
                             };
                             var nicCollection = _resourceGroup.GetNetworkInterfaces();
                             var nicCreateOp = await nicCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, nicName, nicData);
@@ -618,7 +641,6 @@ namespace DeployVMFunction
                             if (nsg == null)
                             {
                                 // Create NSG
-                                _logger.LogInformation($"Creating NSG for VM {vmName}: {nsgName}");
                                 var nsgData = new NetworkSecurityGroupData()
                                 {
                                     Location = locationOption,
@@ -629,6 +651,12 @@ namespace DeployVMFunction
                                             Name = "AllowRDP_From_Guacamole", Priority = 1000, Access = SecurityRuleAccess.Allow, Direction = SecurityRuleDirection.Inbound,
                                             Protocol = SecurityRuleProtocol.Tcp, SourceAddressPrefix = _guacamoleServerPrivateIp, SourcePortRange = "*",
                                             DestinationAddressPrefix = "*", DestinationPortRange = "3389"
+                                        },
+                                        new SecurityRuleData()
+                                        {
+                                            Name = "AllowRDP_From_Internet", Priority = 1100, Access = SecurityRuleAccess.Allow, Direction = SecurityRuleDirection.Inbound,
+                                            Protocol = SecurityRuleProtocol.Tcp, SourceAddressPrefix = "*", SourcePortRange = "*",
+                                            DestinationAddressPrefix = "*", DestinationPortRange = "3389"
                                         }
                                     }
                                 };
@@ -636,17 +664,33 @@ namespace DeployVMFunction
                                 var nsgCreateOp = await nsgCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, nsgName, nsgData);
                                 nsg = nsgCreateOp.Value;
                                 _logger.LogInformation($"NSG created: {nsg.Id}");
-                            }
 
-                            if (nic == null)
-                            {
+                                // Create Public IP
+                                _logger.LogInformation($"Creating public IP for VM {vmName}...");
+                                var publicIpName = $"vm-pip-{purpose}-{timestamp}";
+                                var publicIpData = new PublicIPAddressData() 
+                                {
+                                    Location = locationOption,
+                                    PublicIPAllocationMethod = NetworkIPAllocationMethod.Dynamic
+                                };
+                                var pipCollection = _resourceGroup.GetPublicIPAddresses();
+                                var pipCreateOp = await pipCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, publicIpName, publicIpData);
+                                var pip = pipCreateOp.Value;
+                                _logger.LogInformation($"Public IP created: {pip.Id}");
+
                                 // Create NIC
                                 _logger.LogInformation($"Creating network interface {nicName} in subnet {subnet.Id}");
                                 var nicData = new NetworkInterfaceData()
                                 {
                                     Location = locationOption,
                                     NetworkSecurityGroup = new NetworkSecurityGroupData() { Id = nsg.Id },
-                                    IPConfigurations = { new NetworkInterfaceIPConfigurationData() { Name = "ipconfig1", Primary = true, Subnet = new SubnetData() { Id = subnet.Id }, PrivateIPAllocationMethod = NetworkIPAllocationMethod.Dynamic } }
+                                    IPConfigurations = { new NetworkInterfaceIPConfigurationData() { 
+                                        Name = "ipconfig1", 
+                                        Primary = true, 
+                                        Subnet = new SubnetData() { Id = subnet.Id }, 
+                                        PrivateIPAllocationMethod = NetworkIPAllocationMethod.Dynamic,
+                                        PublicIPAddress = new PublicIPAddressData() { Id = pip.Id }
+                                    } }
                                 };
                                 var nicCollection = _resourceGroup.GetNetworkInterfaces();
                                 var nicCreateOp = await nicCollection.CreateOrUpdateAsync(Azure.WaitUntil.Completed, nicName, nicData);
