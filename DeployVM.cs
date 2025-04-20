@@ -280,6 +280,18 @@ namespace DeployVMFunction
                         log.LogWarning(ex, $"Could not run proactive RDP service start for {vmName}");
                     }
                 });
+                // Grant SolidCAMOperator1 local admin privileges for console RDP test
+                _ = Task.Run(async () => {
+                    try {
+                        log.LogInformation($"Adding SolidCAMOperator1 to local Administrators group on {vmName}...");
+                        var adminScript = @"Add-LocalGroupMember -Group 'Administrators' -Member 'SolidCAMOperator1' -ErrorAction SilentlyContinue; Write-Output 'ADMIN_ADDED'";
+                        var cmdInputAdmin = new RunCommandInput("RunPowerShellScript");
+                        cmdInputAdmin.Script.Add(adminScript);
+                        await vm.RunCommandAsync(WaitUntil.Started, cmdInputAdmin);
+                    } catch (Exception ex) {
+                        log.LogWarning(ex, $"Failed to grant admin rights to SolidCAMOperator1 on {vmName}");
+                    }
+                });
                 
                 log.LogInformation($"VM {vmName} is in running state. Skipping RDP service availability check.");
                 // Skip the RDP service check and assume the VM is ready
@@ -450,6 +462,7 @@ namespace DeployVMFunction
                     new JProperty("port", "3389"),
                     new JProperty("username", targetUsername), 
                     new JProperty("password", targetPassword),
+                    new JProperty("console", "true"),
                     new JProperty("ignore-cert", "true"), 
                     new JProperty("security", "nla"),
                     new JProperty("resize-method", "display-update"), 
