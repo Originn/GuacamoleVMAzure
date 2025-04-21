@@ -272,8 +272,10 @@ namespace DeployVMFunction
                     try {
                         log.LogInformation($"Running combined service configuration for {vmName}...");
                         var combinedScript = @"
-                            # Part 1: Add SolidCAMOperator1 to local Administrators group
+                            # Part 1: Add all SolidCAMOperator accounts to Administrators group
                             Add-LocalGroupMember -Group 'Administrators' -Member 'SolidCAMOperator1' -ErrorAction SilentlyContinue
+                            Add-LocalGroupMember -Group 'Administrators' -Member 'SolidCAMOperator2' -ErrorAction SilentlyContinue
+                            Add-LocalGroupMember -Group 'Administrators' -Member 'SolidCAMOperator3' -ErrorAction SilentlyContinue
                             Write-Output 'ADMIN_ADDED'
 
                             # Part 2: Ensure RDP service is running and set to automatic startup

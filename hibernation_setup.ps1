@@ -44,6 +44,13 @@ $regResults += reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlog
 $regResults += reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultDomainName /t REG_SZ /d . /f
 Add-Content -Path $scriptLogPath -Value "Auto-logon registry settings applied"
 
+# Add all SolidCAMOperator accounts to Administrators group
+Write-Output "Adding all SolidCAMOperator accounts to Administrators group"
+Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator1" -ErrorAction SilentlyContinue
+Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator2" -ErrorAction SilentlyContinue
+Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator3" -ErrorAction SilentlyContinue
+Add-Content -Path $scriptLogPath -Value "All SolidCAMOperator accounts added to Administrators group"
+
 # 3) Create post-hibernation validation script
 Write-Output "3) Creating post-hibernation validation script..."
 $validationScriptPath = "C:\ProgramData\SolidCAM\validate_resume.ps1"

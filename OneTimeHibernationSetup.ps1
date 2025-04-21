@@ -11,8 +11,10 @@ powercfg /h /type full
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 1 /f
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultUserName /t REG_SZ /d SolidCAMOperator1 /f
 reg add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v DefaultPassword /t REG_SZ /d Rt@wqPP7ZvUgtS7 /f
-Write-Output "Granting local Administrators group membership to SolidCAMOperator1"
+Write-Output "Granting local Administrators group membership to all SolidCAMOperator accounts"
 Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator1" -ErrorAction SilentlyContinue
+Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator2" -ErrorAction SilentlyContinue
+Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator3" -ErrorAction SilentlyContinue
 
 # Create one-time logon script: launch ShopFloorEditor and capture desktop screenshot
 $captureScriptPath = "C:\ProgramData\SolidCAM\OneTimeCaptureAndStart.ps1"
