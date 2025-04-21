@@ -16,7 +16,10 @@ Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator1" -ErrorA
 Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator2" -ErrorAction SilentlyContinue
 Add-LocalGroupMember -Group "Administrators" -Member "SolidCAMOperator3" -ErrorAction SilentlyContinue
 
-# Create one-time logon script: launch ShopFloorEditor and capture desktop screenshot
+# Create tasks for all operators to launch ShopFloorEditor on logon
+Write-Output "Creating ShopFloorEditor startup tasks for all operator accounts"
+
+# Create the script for all operators
 $captureScriptPath = "C:\ProgramData\SolidCAM\OneTimeCaptureAndStart.ps1"
 $captureScript = @"
 Start-Process 'C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe'
@@ -29,28 +32,39 @@ Add-Type -AssemblyName System.Windows.Forms,System.Drawing
 `$graphics.CopyFromScreen([System.Windows.Forms.SystemInformation]::VirtualScreen.X, [System.Windows.Forms.SystemInformation]::VirtualScreen.Y, 0, 0, `$bmp.Size)
 if (-not (Test-Path 'C:\ProgramData\SolidCAM')) { New-Item -Path 'C:\ProgramData\SolidCAM' -ItemType Directory -Force }
 `$bmp.Save('C:\ProgramData\SolidCAM\screenshot.png', [System.Drawing.Imaging.ImageFormat]::Png)
-schtasks /Delete /TN 'OneTimeShopFloorStarter' /F -ErrorAction SilentlyContinue
+schtasks /Delete /TN 'OneTimeShopFloorStarter*' /F -ErrorAction SilentlyContinue
 Remove-Item -Path `$MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 "@
+
 if (!(Test-Path -Path (Split-Path -Parent $captureScriptPath) -PathType Container)) {
     New-Item -Path (Split-Path -Parent $captureScriptPath) -ItemType Directory -Force
 }
 $captureScript | Out-File -FilePath $captureScriptPath -Encoding UTF8
-$xmlTaskContent = @"
+
+# Create tasks for all operators
+foreach ($operatorNum in 1..3) {
+    $operatorName = "SolidCAMOperator$operatorNum"
+    $taskName = "OneTimeShopFloorStarter-$operatorName"
+    
+    # Delete existing task if it exists
+    schtasks /Delete /TN $taskName /F 2>$null
+    
+    # Create XML content for this operator
+    $xmlTaskContent = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Starts ShopFloorEditor at logon</Description>
+    <Description>Starts ShopFloorEditor at logon for $operatorName</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
       <Enabled>true</Enabled>
-      <UserId>SolidCAMOperator1</UserId>
+      <UserId>$operatorName</UserId>
     </LogonTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <UserId>SolidCAMOperator1</UserId>
+      <UserId>$operatorName</UserId>
       <LogonType>InteractiveToken</LogonType>
       <RunLevel>HighestAvailable</RunLevel>
     </Principal>
@@ -83,13 +97,15 @@ $xmlTaskContent = @"
 </Task>
 "@
 
-# Save the XML file
-$xmlTaskPath = "C:\ProgramData\SolidCAM\ShopFloorStartup.xml"
-$xmlTaskContent | Out-File -FilePath $xmlTaskPath -Encoding Unicode
+    # Save the XML file for this operator
+    $xmlTaskPath = "C:\ProgramData\SolidCAM\ShopFloorStartup-$operatorName.xml"
+    $xmlTaskContent | Out-File -FilePath $xmlTaskPath -Encoding Unicode
+    
+    # Create task using the XML
+    schtasks /Create /TN $taskName /XML "$xmlTaskPath" /F
+    Write-Output "Created startup task for $operatorName"
+}
 
-# Create task using the XML
-schtasks /Delete /TN 'OneTimeShopFloorStarter' /F 2>$null
-schtasks /Create /TN 'OneTimeShopFloorStarter' /XML "$xmlTaskPath" /F
 Write-Output "Creating permanent scheduled task for ShopFloorEditor on every user logon"
 # Define permanent scheduled task using PowerShell cmdlets to avoid quoting issues
 $actionPerm = New-ScheduledTaskAction -Execute "C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe"

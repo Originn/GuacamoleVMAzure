@@ -154,14 +154,10 @@ Register-ScheduledTask -TaskName $validateTaskName `
                       -Principal $principal `
                       -Force
 
-# 4) Create startup task for ShopFloorEditor on boot
-Write-Output "4) Creating ShopFloorEditor startup task..."
-$startupTaskName = "SolidCAM-StartShopFloorEditor"
-$taskExists = Get-ScheduledTask -TaskName $startupTaskName -ErrorAction SilentlyContinue
-if ($taskExists) {
-    Unregister-ScheduledTask -TaskName $startupTaskName -Confirm:$false
-}
+# 4) Create startup tasks for all ShopFloorEditor operator accounts
+Write-Output "4) Creating ShopFloorEditor startup tasks for all operator accounts..."
 
+# Common startup script for all operators
 $startupScript = @"
 @echo off
 echo Starting ShopFloorEditor startup check at %date% %time% > C:\ProgramData\SolidCAM\startup_log.txt
@@ -182,17 +178,55 @@ if errorlevel 1 (
 $startupScriptPath = "C:\ProgramData\SolidCAM\start_shopfloor.cmd"
 Set-Content -Path $startupScriptPath -Value $startupScript -Force
 
+# Create scheduled tasks for each operator
+foreach ($operatorNum in 1..3) {
+    $operatorName = "SolidCAMOperator$operatorNum"
+    $startupTaskName = "SolidCAM-StartShopFloorEditor-$operatorName"
+    
+    # Remove existing task if it exists
+    $taskExists = Get-ScheduledTask -TaskName $startupTaskName -ErrorAction SilentlyContinue
+    if ($taskExists) {
+        Unregister-ScheduledTask -TaskName $startupTaskName -Confirm:$false
+    }
+    
+    # Create new task
+    $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$startupScriptPath`""
+    $trigger = New-ScheduledTaskTrigger -AtLogon -User $operatorName
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    $principal = New-ScheduledTaskPrincipal -UserId $operatorName -LogonType Interactive -RunLevel Highest
+    
+    Register-ScheduledTask -TaskName $startupTaskName `
+                          -Action $action `
+                          -Trigger $trigger `
+                          -Settings $settings `
+                          -Principal $principal `
+                          -Force
+                          
+    Write-Output "Created startup task for $operatorName"
+    Add-Content -Path $scriptLogPath -Value "Created scheduled task for $operatorName to start ShopFloorEditor at logon"
+}
+
+# Create a system-wide scheduled task as backup
+$systemTaskName = "SolidCAM-StartShopFloorEditor-System"
+$taskExists = Get-ScheduledTask -TaskName $systemTaskName -ErrorAction SilentlyContinue
+if ($taskExists) {
+    Unregister-ScheduledTask -TaskName $systemTaskName -Confirm:$false
+}
+
 $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$startupScriptPath`""
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-Register-ScheduledTask -TaskName $startupTaskName `
-                      -Action $action `
-                      -Trigger $trigger `
-                      -Settings $settings `
-                      -Principal $principal `
-                      -Force
+Register-ScheduledTask -TaskName $systemTaskName `
+                       -Action $action `
+                       -Trigger $trigger `
+                       -Settings $settings `
+                       -Principal $principal `
+                       -Force
+                       
+Write-Output "Created system-wide startup task"
+Add-Content -Path $scriptLogPath -Value "Created system-wide scheduled task to start ShopFloorEditor at startup"
 
 # 5) Start ShopFloorEditor now
 $editorPath = "C:\Program Files\SolidCAM2024 Maker\solidcam\ShopFloorEditor.exe"

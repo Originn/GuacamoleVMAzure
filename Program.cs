@@ -554,18 +554,87 @@ Write-Output ""Done with initialization.""
         }
 
         // Configure multiple user accounts (SolidCAMOperator1, SolidCAMOperator2, etc.)
-        // Configure multiple user accounts (SolidCAMOperator1, SolidCAMOperator2, etc.)
         public static async Task<bool> ConfigureMultiUserAccountsAsync(VirtualMachineResource vm, string password, ILogger logger)
         {
-            // MODIFIED: Skip actual account configuration and just store default password
-            logger.LogInformation($"SKIPPED: Account configuration for VM {vm.Data.Name}. Using default password instead.");
+            logger.LogInformation($"Configuring multiple user accounts on VM {vm.Data.Name}...");
             
-            // Use the default password regardless of what was passed in
+            // Use the default password
             string defaultPassword = "Rt@wqPP7ZvUgtS7";
             
-            // Return success without actually configuring accounts
-            logger.LogInformation($"Using default password for all SolidCAMOperator accounts on VM {vm.Data.Name}");
-            return true;
+            // Create PowerShell script to configure all three accounts
+            string psScript = @"
+$p = ConvertTo-SecureString 'Rt@wqPP7ZvUgtS7' -AsPlainText -Force;
+
+# Configure accounts
+foreach ($userNum in 1..3) {
+    $username = 'SolidCAMOperator' + $userNum
+    Write-Output ""Setting up $username...""
+
+    # Create or update user
+    $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+    if ($user) {
+        Set-LocalUser -Name $username -Password $p -AccountNeverExpires -PasswordNeverExpires $true
+    } else {
+        New-LocalUser -Name $username -Password $p -AccountNeverExpires -PasswordNeverExpires $true
+    }
+
+    # Enable user
+    Enable-LocalUser -Name $username
+
+    # Add to groups
+    Add-LocalGroupMember -Group 'Administrators' -Member $username -ErrorAction SilentlyContinue
+    Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $username -ErrorAction SilentlyContinue
+
+    Write-Output ""$username setup complete""
+}
+
+Write-Output ""All operator accounts configured successfully.""
+";
+
+            
+            // Execute the script on the VM
+            var runCommandInput = new RunCommandInput("RunPowerShellScript");
+            runCommandInput.Script.Add(psScript);
+            
+            try
+            {
+                var commandStartTime = DateTime.UtcNow;
+                logger.LogInformation($"Executing multi-account setup script on VM {vm.Data.Name}...");
+                
+                var accountSetupOperation = await vm.RunCommandAsync(WaitUntil.Completed, runCommandInput);
+                var setupResult = accountSetupOperation?.Value;
+                
+                // Log results and check for success
+                if (setupResult?.Value != null && setupResult.Value.Any())
+                {
+                    bool errorFound = false;
+                    foreach (var status in setupResult.Value)
+                    {
+                        logger.LogInformation($"Account setup output: {status.Message}");
+                        if (status.Level?.ToString().Equals("Error", StringComparison.OrdinalIgnoreCase) == true)
+                        {
+                            errorFound = true;
+                            logger.LogError($"Error in multi-account setup: {status.Message}");
+                        }
+                    }
+                    
+                    if (!errorFound)
+                    {
+                        var commandEndTime = DateTime.UtcNow;
+                        var commandDuration = commandEndTime - commandStartTime;
+                        logger.LogInformation($"Successfully configured all operator accounts on VM {vm.Data.Name} in {commandDuration.TotalSeconds:F2} seconds");
+                        return true;
+                    }
+                }
+                
+                logger.LogWarning($"Failed to configure operator accounts on VM {vm.Data.Name}");
+                return false;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, $"Exception during multi-account setup on VM {vm.Data.Name}");
+                return false;
+            }
         }
 
         // Store VM password in Table Storage and cache - Updated with better error handling
